@@ -42,6 +42,7 @@ The Electron app starts its Python gateway as a detached background process, out
 Caveats:
 
 - One Rust run took 21.5 s to show its window. It is excluded by the median but still listed in the raw results; it looks like the window opened on another macOS Space.
+- These figures predate the built-in Python for plugins. The bundled CPython runtime adds about 17 MB to the macOS download (≈56 MB zipped now). It only runs while a Python plugin is enabled, so memory and CPU at idle are unchanged.
 - These are macOS numbers only. The Windows and Linux builds are tested in CI and have not been benchmarked.
 
 To reproduce:
