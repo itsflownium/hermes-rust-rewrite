@@ -1,7 +1,9 @@
+mod support;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use hermes_engine::{Config, Entry, History, Status, Turn};
-use hermes_gateway::{Gateway, GatewayConfig, RunningGateway, owner};
+use hermes_gateway::{Gateway, GatewayConfig, RunningGateway};
 use hermes_library::Library;
 use reqwest::{Client, Response, StatusCode, header};
 use serde_json::{Value, json};
@@ -12,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error, Message, client::IntoClientRequest},
@@ -585,17 +587,7 @@ async fn provisioned_stock_token_authenticates_rest_and_requires_a_remote_ticket
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let local = loop {
-        if let Some(owner) = owner::discover(root).await.unwrap() {
-            break owner;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "gateway did not publish its endpoint"
-        );
-        sleep(Duration::from_millis(40)).await;
-    };
+    let local = support::wait_for_owner(root, Duration::from_secs(15)).await;
     let client = http();
     let base = &local.origin;
     let ws = format!("{}/api/ws", base.replacen("http:", "ws:", 1));

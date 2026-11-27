@@ -3250,6 +3250,7 @@ dependencies = [
  "hermes-gateway-core",
  "hermes-library",
  "hermes-reliquary-plugin",
+ "hermes-slack-plugin",
  "hermes-telegram-plugin",
  "reqwest",
  "ring",
@@ -3334,6 +3335,29 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "hermes-slack-plugin"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "hermes-engine",
+ "hermes-gateway-core",
+ "hermes-library",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "unicode-segmentation",
+ "url",
 ]
 
 [[package]]

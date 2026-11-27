@@ -9,7 +9,7 @@ use super::{
     stock::{StockAdapter, StockConfiguration, StockConnection},
     storage::AdapterStorage,
     store::{self, OutboundPolicy, PendingDelivery, Store},
-    transport::{InstallationKey, SharedReceiver},
+    transport::{InstallationKey, ReceiverLease, SharedReceiver},
     types::*,
     webhook_receiver::Webhook,
 };
@@ -106,6 +106,23 @@ pub struct Ingress {
 }
 
 impl Ingress {
+    /// Claim the receiver verified for this installation. The gateway lease
+    /// spans profiles in the installation, just like a shared receiver lease.
+    pub fn claim_receiver(&self) -> Result<ReceiverLease, GatewayError> {
+        self.checked(true, |_| {
+            let receiver = self
+                .installation()
+                .and_then(|proof| proof.receiver.as_ref())
+                .ok_or(GatewayError::Unsupported)?;
+            let identity = db(store::key("receiver", receiver))?;
+            let lease = db(account_lease(&self.root, &identity))?.ok_or(GatewayError::Conflict)?;
+            Ok(ReceiverLease {
+                scope: self.clone(),
+                _lease: lease,
+            })
+        })
+    }
+
     pub(super) fn name(&self) -> &str {
         &self.slot.name
     }

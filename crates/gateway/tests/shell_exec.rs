@@ -1,6 +1,8 @@
+mod support;
+
 use hermes_gateway::{
     client::{ClientError, ClientOptions, GatewayClient},
-    owner::{self, OwnerConnection},
+    owner::OwnerConnection,
 };
 use serde_json::{Value, json};
 use std::{
@@ -9,7 +11,6 @@ use std::{
     process::{Child, Command, Stdio},
     time::Duration,
 };
-use tokio::time::{Instant, sleep};
 
 const PROVIDER_SECRET: &str = "synthetic-provider-value-for-shell-boundary";
 const WORKSPACE: &str = "fixture-shell-working-directory";
@@ -46,17 +47,7 @@ fn launch(root: &Path) -> Process {
 }
 
 async fn ready(root: &Path) -> OwnerConnection {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(owner) = owner::discover(root).await.unwrap() {
-            return owner;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "gateway did not publish a profile endpoint"
-        );
-        sleep(Duration::from_millis(40)).await;
-    }
+    support::wait_for_owner(root, Duration::from_secs(15)).await
 }
 
 async fn request(

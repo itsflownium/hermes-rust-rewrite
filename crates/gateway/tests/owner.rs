@@ -1,3 +1,5 @@
+mod support;
+
 use hermes_gateway::{
     client::{ClientOptions, GatewayClient},
     owner,
@@ -32,17 +34,7 @@ fn launch(root: &Path) -> Process {
     )
 }
 async fn ready(home: &Path) -> owner::OwnerConnection {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(owner) = owner::discover(home).await.unwrap() {
-            return owner;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "gateway did not publish a profile endpoint"
-        );
-        sleep(Duration::from_millis(40)).await;
-    }
+    support::wait_for_owner(home, Duration::from_secs(10)).await
 }
 #[tokio::test]
 async fn bundled_gateway_registers_discord_for_the_profile_owner() {

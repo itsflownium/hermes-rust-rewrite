@@ -22,6 +22,45 @@ CREATE TABLE IF NOT EXISTS messaging_destination_scope (
 ";
 
 impl Ingress {
+    /// Share a direct thread with its parent conversation before admission.
+    /// The verified adapter must supply the same direct participant in both
+    /// destinations. An existing independent conversation keeps its binding.
+    /// Replies still use the event's exact thread.
+    pub async fn share_direct_thread(&self, event: InboundEvent) -> Result<(), GatewayError> {
+        if event.room.kind != RoomKind::Direct || event.room.thread.is_none() {
+            return Err(GatewayError::Invalid);
+        }
+        let scope = self.clone();
+        blocking(move || {
+            scope.checked(true, |state| {
+                let mut parent = event.clone();
+                parent.room.thread = None;
+                parent.reply_anchor = None;
+                for event in [&event, &parent] {
+                    if !scope
+                        .authorized_identity(&state.policy, &event.room, &event.sender)?
+                        .is_some_and(|(_, actor)| actor == super::ActorKind::Person)
+                    {
+                        return Err(GatewayError::Forbidden);
+                    }
+                }
+                let Ok(destination) = scope.route_candidate(&state.policy, &event, true)? else {
+                    return Err(GatewayError::Forbidden);
+                };
+                let Ok(binding) = scope.route_candidate(&state.policy, &parent, true)? else {
+                    return Err(GatewayError::Forbidden);
+                };
+                db(scope.store.write(|tx| {
+                    insert_route(tx, &destination)?;
+                    insert_route(tx, &binding)?;
+                    attach_conversation(tx, &destination, &binding)?;
+                    Ok(())
+                }))
+            })
+        })
+        .await
+    }
+
     /// Record scoped, provider-verified write access. This allows the owner to
     /// configure a home destination before a conversation exists.
     pub async fn verify_destination(
@@ -151,6 +190,26 @@ pub(super) fn share_conversation(
     destination: &Route,
     binding: &Route,
 ) -> Result<()> {
+    match attach_conversation(tx, destination, binding)? {
+        BindingResult::Shared => Ok(()),
+        BindingResult::Assigned => anyhow::bail!("The destination already shares a conversation"),
+        BindingResult::Unavailable => anyhow::bail!(
+            "Both bindings must be available and the destination must be idle and unbound"
+        ),
+    }
+}
+
+enum BindingResult {
+    Shared,
+    Assigned,
+    Unavailable,
+}
+
+fn attach_conversation(
+    tx: &Transaction<'_>,
+    destination: &Route,
+    binding: &Route,
+) -> Result<BindingResult> {
     ensure!(
         destination.connection == binding.connection && destination.id != binding.id,
         "Messaging session binding must stay within one verified account"
@@ -167,12 +226,11 @@ pub(super) fn share_conversation(
         )
         .optional()?;
     if current.as_deref() == Some(binding.id.as_str()) {
-        return Ok(());
+        return Ok(BindingResult::Shared);
     }
-    ensure!(
-        current.is_none(),
-        "The destination already shares a conversation"
-    );
+    if current.is_some() {
+        return Ok(BindingResult::Assigned);
+    }
     let valid = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?1 AND session IS NULL AND blocked = 0)
                   AND NOT EXISTS(SELECT 1 FROM messaging_route_bindings WHERE destination = ?2 OR binding = ?1)
@@ -182,13 +240,12 @@ pub(super) fn share_conversation(
                   AND EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?2 AND blocked = 0)",
                 params![destination.id,binding.id], |row| row.get::<_,bool>(0),
             )?;
-    ensure!(
-        valid,
-        "Both bindings must be available and the destination must be idle and unbound"
-    );
+    if !valid {
+        return Ok(BindingResult::Unavailable);
+    }
     tx.execute(
         "INSERT INTO messaging_route_bindings(destination,binding) VALUES (?1,?2)",
         params![destination.id, binding.id],
     )?;
-    Ok(())
+    Ok(BindingResult::Shared)
 }

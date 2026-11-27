@@ -6,9 +6,9 @@ use crate::messaging::{
     store,
 };
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequesterCommand {
     Status,
@@ -18,7 +18,7 @@ pub enum RequesterCommand {
 
 /// A command from an authenticated private-response transport. The receipt
 /// has no conversation route and can never enter the session or outbox queues.
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RequesterInvocation {
     pub id: String,
     pub room: Room,

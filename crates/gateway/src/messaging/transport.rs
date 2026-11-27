@@ -44,6 +44,17 @@ pub struct SharedReceiver {
     pub(super) _lease: File,
 }
 
+pub struct ReceiverLease {
+    pub(super) scope: Ingress,
+    pub(super) _lease: File,
+}
+
+impl ReceiverLease {
+    pub fn check(&self) -> Result<(), GatewayError> {
+        self.scope.checked(true, |_| Ok(()))
+    }
+}
+
 impl SharedReceiver {
     pub fn route_verified(&self, matches: &[InstallationKey]) -> Result<Ingress, GatewayError> {
         let route = self.match_installation(matches).ok_or(GatewayError::Forbidden)?;
