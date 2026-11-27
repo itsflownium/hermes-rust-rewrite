@@ -234,6 +234,23 @@ impl Store {
         })?;
         Ok(Arc::new(file))
     }
+
+    /// Detect records that need a cutover before a different runtime can
+    /// acknowledge updates for this bot. Check while holding the account lease.
+    pub fn has_native_state(&self, bot_id: i64) -> Result<bool, String> {
+        if self.root.join(format!("bot-{bot_id}.inbox.json")).try_exists().map_err(|e| e.to_string())? {
+            return Ok(true);
+        }
+        if self.root.join("settings.json").try_exists().map_err(|e| e.to_string())? {
+            let _lock = self.lock("settings.lock")?;
+            let settings = self.read_saved()?;
+            let saved_bot = settings.pointer("/bot/id").and_then(Value::as_i64);
+            if saved_bot == Some(bot_id) || (saved_bot.is_none() && !settings["token"].is_null()) {
+                return Ok(true);
+            }
+        }
+        self.has_native_inbox(bot_id)
+    }
     /// Check current policy while taking a durable step toward execution or delivery.
     pub fn with_agent_policy<T>(
         &self,

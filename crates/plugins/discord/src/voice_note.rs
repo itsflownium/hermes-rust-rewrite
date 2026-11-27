@@ -1,20 +1,15 @@
 use crate::messaging::{GatewayError, Ingress, MediaSource, Room, runtime::db, storage as store};
+use crate::messaging::voice_codec::{MAX_ENCODED_BYTES as MAX_BYTES, MAX_ENCODED_SECONDS as MAX_SECONDS};
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ogg::{PacketWriteEndInfo, PacketWriter};
-use opus2::{Application, Bitrate, Channels, Encoder};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::io::Cursor;
 
 pub(super) const FLAG: u64 = 1 << 13;
 pub(super) const MIME: &str = "audio/ogg";
 pub(super) const FILENAME: &str = "voice-message.ogg";
 const RATE: usize = 48_000;
-const FRAME: usize = RATE / 50;
-const MAX_SECONDS: usize = 90;
 const WAVEFORM_POINTS: usize = 256;
-const MAX_BYTES: usize = 1024 * 1024;
 
 pub(crate) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_discord_voice_sources (
@@ -132,118 +127,11 @@ impl VoiceNote {
     }
 }
 
-/// Read the mono 16-bit PCM WAV emitted by the profile speech service.
-pub(super) fn wav_pcm(bytes: &[u8]) -> Option<(usize, &[u8])> {
-    let (rate, channels, samples) = wav_pcm_format(bytes)?;
-    (channels == 1).then_some((rate, samples))
-}
-
-pub(super) fn wav_pcm_format(bytes: &[u8]) -> Option<(usize, u32, &[u8])> {
-    if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
-        return None;
-    }
-    let mut chunks = bytes.get(12..)?;
-    let mut format = None;
-    let mut samples = None;
-    while !chunks.is_empty() {
-        let header = chunks.get(..8)?;
-        let size = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-        let end = 8usize.checked_add(size)?;
-        let data = chunks.get(8..end)?;
-        match &header[..4] {
-            b"fmt " if data.get(..2)? == [1, 0] && data.get(14..16)? == [16, 0] => {
-                let channels = u16::from_le_bytes(data.get(2..4)?.try_into().ok()?);
-                let rate = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
-                format = Some((rate, u32::from(channels)));
-            }
-            b"data" if !data.is_empty() && data.len().is_multiple_of(2) => samples = Some(data),
-            _ => {}
-        }
-        chunks = chunks.get(end + size % 2..)?;
-    }
-    let (rate, channels) = format?;
-    let samples = samples?;
-    ((8_000..=192_000).contains(&rate)
-        && (1..=2).contains(&channels)
-        && samples.len().is_multiple_of(channels as usize * 2))
-        .then_some((rate, channels, samples))
-}
+pub(super) use crate::messaging::voice_codec::wav_pcm_format;
 
 pub(super) fn encode(wav: &[u8]) -> Result<VoiceNote, GatewayError> {
-    let invalid = GatewayError::Invalid;
-    let (source_rate, pcm) = wav_pcm(wav).ok_or(invalid)?;
-    let source_count = pcm.len() / 2;
-    if source_count > source_rate * MAX_SECONDS {
-        return Err(GatewayError::Unsupported);
-    }
-    let count = (source_count as u64 * RATE as u64).div_ceil(source_rate as u64);
-    let sample = |index: usize| i16::from_le_bytes([pcm[index * 2], pcm[index * 2 + 1]]);
-    let samples: Vec<i16> = (0..count)
-        .map(|index| {
-            let position = index * source_rate as u64;
-            let (left, weight) = (
-                (position / RATE as u64) as usize,
-                (position % RATE as u64) as i64,
-            );
-            let a = i64::from(sample(left));
-            let b = i64::from(sample((left + 1).min(source_count - 1)));
-            (a + (b - a) * weight / RATE as i64) as i16
-        })
-        .collect();
-
-    let mut codec =
-        Encoder::new(RATE as u32, Channels::Mono, Application::Voip).map_err(|_| invalid)?;
-    codec
-        .set_bitrate(Bitrate::Bits(32_000))
-        .map_err(|_| invalid)?;
-    let lookahead =
-        u16::try_from(codec.get_lookahead().map_err(|_| invalid)?).map_err(|_| invalid)?;
-
-    let mut writer = PacketWriter::new(Cursor::new(Vec::new()));
-    let mut head = b"OpusHead\x01\x01".to_vec();
-    head.extend_from_slice(&lookahead.to_le_bytes());
-    head.extend_from_slice(&(RATE as u32).to_le_bytes());
-    head.extend_from_slice(&[0, 0, 0]); // Zero gain and mapping family 0 (mono).
-    writer
-        .write_packet(head, 1, PacketWriteEndInfo::EndPage, 0)
-        .map_err(|_| invalid)?;
-    writer
-        .write_packet(
-            b"OpusTags\x07\x00\x00\x00Mercury\0\0\0\0".as_slice(),
-            1,
-            PacketWriteEndInfo::EndPage,
-            0,
-        )
-        .map_err(|_| invalid)?;
-
-    let final_granule = samples.len() + usize::from(lookahead);
-    let frames = final_granule.div_ceil(FRAME);
-    let mut frame = [0i16; FRAME];
-    let mut output = [0u8; 1275];
-    for index in 0..frames {
-        frame.fill(0);
-        let offset = index * FRAME;
-        if offset < samples.len() {
-            let remaining = FRAME.min(samples.len() - offset);
-            frame[..remaining].copy_from_slice(&samples[offset..offset + remaining]);
-        }
-        let len = codec.encode(&frame, &mut output).map_err(|_| invalid)?;
-        let last = index + 1 == frames;
-        let state = if last {
-            PacketWriteEndInfo::EndStream
-        } else {
-            PacketWriteEndInfo::NormalPacket
-        };
-        let granule = if last { final_granule } else { offset + FRAME };
-        writer
-            .write_packet(output[..len].to_vec(), 1, state, granule as u64)
-            .map_err(|_| invalid)?;
-    }
-
-    let bytes = writer.into_inner().into_inner();
-    if bytes.len() > MAX_BYTES {
-        return Err(GatewayError::Unsupported);
-    }
+    let crate::messaging::voice_codec::EncodedVoiceNote { bytes, samples } =
+        crate::messaging::voice_codec::encode_voice_note(wav)?;
     let window = (RATE / 10).max(samples.len().div_ceil(WAVEFORM_POINTS));
     let waveform = STANDARD.encode(
         samples

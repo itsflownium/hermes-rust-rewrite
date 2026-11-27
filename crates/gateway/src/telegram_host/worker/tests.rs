@@ -60,6 +60,7 @@ impl Transport for Telegram {
                     }
                     Ok(json!({"message_id":message_id, "chat":{"id":chat}, "date":1234}))
                 }
+                _ => panic!("The predecessor host requested an unexpected Telegram method"),
             }
         })
     }

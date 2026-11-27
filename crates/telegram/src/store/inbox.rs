@@ -101,6 +101,23 @@ pub enum DeliveryResolution {
 }
 
 impl Store {
+    pub(super) fn has_native_inbox(&self, bot_id: i64) -> Result<bool, String> {
+        let Some(sql) = db::open_existing(&self.profile).map_err(storage)? else {
+            return Ok(false);
+        };
+        let installed: bool = sql.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='telegram_inboxes')",
+            [], |row| row.get(0),
+        ).map_err(storage)?;
+        if !installed {
+            return Ok(false);
+        }
+        sql.query_row(
+            "SELECT EXISTS(SELECT 1 FROM telegram_inboxes WHERE bot_id=?1)",
+            [bot_id], |row| row.get(0),
+        ).map_err(storage)
+    }
+
     fn open_inbox(&self, bot: &Identity) -> Result<Connection, String> {
         if bot.id <= 0 {
             return Err("Telegram bot identity is invalid".into());

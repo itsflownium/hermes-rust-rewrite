@@ -15,6 +15,7 @@ reliquary = ["hermes-gateway-core/reliquary", "dep:hermes-reliquary-plugin"]
 anyhow.workspace = true
 hermes-gateway-core = { path = "core" }
 hermes-discord-plugin = { path = "../plugins/discord" }
+hermes-telegram-plugin = { path = "../plugins/telegram" }
 hermes-reliquary-plugin = { path = "../plugins/reliquary", optional = true }
 tokio.workspace = true
 

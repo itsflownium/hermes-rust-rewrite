@@ -346,6 +346,7 @@ mod tests {
                 Method::GetWebhookInfo => "getWebhookInfo",
                 Method::GetUpdates => "getUpdates",
                 Method::SendMessage => "sendMessage",
+                other => panic!("Unexpected method in the prior Telegram fixture: {other:?}"),
             };
             self.calls.lock().unwrap().push(name.to_owned());
             let response = match method {
@@ -368,6 +369,7 @@ mod tests {
                 Method::SendMessage => {
                     Ok(json!({"message_id":77,"date":1234,"chat":{"id":body["chat_id"]}}))
                 }
+                other => panic!("Unexpected method in the prior Telegram fixture: {other:?}"),
             };
             let pause = matches!(method, Method::GetUpdates);
             Box::pin(async move {

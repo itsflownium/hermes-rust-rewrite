@@ -1,8 +1,10 @@
 use super::client::{DiscordClient, RestFailure};
 use crate::messaging::{
     AttachmentManifest, GatewayError, Ingress, MediaPurpose, MediaSource, Message,
-    media::{MAX_ADAPTER_FILE, MAX_ADAPTER_INPUT_BYTES, MAX_FILE, PreparedAudio, valid_name},
+    media::{MAX_ADAPTER_FILE, MAX_ADAPTER_INPUT_BYTES, PreparedAudio, valid_name},
 };
+pub(super) use crate::messaging::voice_codec::{decode_voice_note, pcm_wave};
+
 use futures_util::TryStreamExt;
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,6 @@ mod tests;
 
 const MAX_ATTACHMENTS: usize = 8;
 const MEDIA_LIFETIME: Duration = Duration::from_secs(90);
-const SAMPLE_RATE: usize = 16_000;
-const MAX_VOICE_SAMPLES: usize = 120 * SAMPLE_RATE;
 
 /// Immutable evidence retained with the prepared message. Discord signs
 /// access URLs again when an authorized reader retrieves the message.
@@ -307,97 +307,4 @@ async fn open_cdn(
     Ok(StreamReader::new(
         response.bytes_stream().map_err(io::Error::other),
     ))
-}
-
-/// Voice notes are Ogg Opus. Apply pre-skip and the ending granule at
-/// the output sample rate and bound decoded PCM independently of file size.
-pub(super) fn decode_voice_note(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
-    if bytes.starts_with(b"RIFF") {
-        return if bytes.len() <= MAX_FILE {
-            Ok(bytes.to_vec())
-        } else {
-            Err(GatewayError::Unsupported)
-        };
-    }
-    let mut reader = ogg::PacketReader::new(io::Cursor::new(bytes));
-    let head = reader
-        .read_packet()
-        .map_err(|_| GatewayError::Invalid)?
-        .ok_or(GatewayError::Invalid)?;
-    let data = &head.data;
-    if data.len() != 19
-        || !data.starts_with(b"OpusHead\x01")
-        || data[18] != 0
-        || !head.first_in_stream()
-    {
-        return Err(GatewayError::Unsupported);
-    }
-    let pre_skip = usize::from(u16::from_le_bytes([data[10], data[11]]));
-    let skip_output = pre_skip.div_ceil(3);
-    let channels = match data[9] {
-        1 | 2 => opus2::Channels::Mono,
-        _ => return Err(GatewayError::Unsupported),
-    };
-    let tags = reader
-        .read_packet()
-        .map_err(|_| GatewayError::Invalid)?
-        .ok_or(GatewayError::Invalid)?;
-    if tags.stream_serial() != head.stream_serial() || !tags.data.starts_with(b"OpusTags") {
-        return Err(GatewayError::Invalid);
-    }
-    let mut decoder =
-        opus2::Decoder::new(SAMPLE_RATE as u32, channels).map_err(|_| GatewayError::Unsupported)?;
-    let mut pcm = Vec::new();
-    let mut frame = [0; 120 * SAMPLE_RATE / 1000];
-    while let Some(packet) = reader.read_packet().map_err(|_| GatewayError::Invalid)? {
-        if packet.stream_serial() != head.stream_serial()
-            || packet.data.is_empty()
-            || packet.data.len() > 1275
-        {
-            return Err(GatewayError::Invalid);
-        }
-        let samples = decoder
-            .decode(&packet.data, &mut frame, false)
-            .map_err(|_| GatewayError::Invalid)?;
-        if pcm.len() + samples > MAX_VOICE_SAMPLES + skip_output {
-            return Err(GatewayError::Unsupported);
-        }
-        pcm.extend_from_slice(&frame[..samples]);
-        if packet.last_in_stream() {
-            let end =
-                usize::try_from(packet.absgp_page() / 3).map_err(|_| GatewayError::Invalid)?;
-            if reader
-                .read_packet()
-                .map_err(|_| GatewayError::Invalid)?
-                .is_some()
-                || end > pcm.len()
-                || end <= skip_output
-            {
-                return Err(GatewayError::Invalid);
-            }
-            return Ok(pcm_wave(&pcm[skip_output..end]));
-        }
-    }
-    Err(GatewayError::Invalid)
-}
-
-pub(super) fn pcm_wave(samples: &[i16]) -> Vec<u8> {
-    let sample_bytes = (samples.len() * size_of::<i16>()) as u32;
-    let mut bytes = Vec::with_capacity(44 + sample_bytes as usize);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + sample_bytes).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
-    bytes.extend_from_slice(&(2 * SAMPLE_RATE as u32).to_le_bytes());
-    bytes.extend_from_slice(&2u16.to_le_bytes());
-    bytes.extend_from_slice(&16u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&sample_bytes.to_le_bytes());
-    for sample in samples {
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    bytes
 }

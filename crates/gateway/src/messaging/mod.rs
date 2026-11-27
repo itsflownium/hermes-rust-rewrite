@@ -26,7 +26,10 @@ mod system_audio;
 mod timed;
 mod transport;
 mod types;
+#[cfg(feature = "voice-codec")]
+pub mod voice_codec;
 mod wake;
+pub(crate) mod webhook_receiver;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -57,3 +60,4 @@ pub use timed::*;
 pub use transport::*;
 pub use types::*;
 pub use wake::*;
+pub use webhook_receiver::WebhookHandler;

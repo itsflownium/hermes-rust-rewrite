@@ -398,6 +398,7 @@ impl Gateway {
             .route("/api/webapp/socket-ticket", post(terminal::ticket))
             .route("/api/host-terminal", get(terminal::upgrade))
             .route("/webhooks/{name}", post(webhooks::receive))
+            .route("/api/messaging/webhooks/{key}", post(messaging::webhook_receiver::receive))
             .with_state(shared.clone());
         let stop = shared.shutdown.clone();
         let on_stop = shared.clone();

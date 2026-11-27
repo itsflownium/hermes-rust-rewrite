@@ -1,9 +1,11 @@
 //! Native Telegram Bot API transport. No Python process or gateway wrapper.
 //! Protocol: https://core.telegram.org/bots/api#getupdates and #sendmessage.
+use reqwest::{Response, Url, multipart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio_util::sync::CancellationToken;
+use tokio::io::AsyncRead;
+use tokio_util::{io::StreamReader, sync::CancellationToken};
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -56,6 +58,8 @@ pub enum ErrorKind {
     Invalid,
     Retryable,
     RateLimited,
+    Conflict,
+    Credentials,
     Cancelled,
     Rejected,
 }
@@ -94,105 +98,300 @@ pub enum Method {
     GetWebhookInfo,
     GetUpdates,
     SendMessage,
+    SetWebhook,
+    DeleteWebhook,
+    GetChat,
+    GetChatMember,
+    SetMyCommands,
+    AnswerCallbackQuery,
+    SendChatAction,
+    EditMessageText,
+    EditMessageReplyMarkup,
+    SendMessageDraft,
+    SendRichMessage,
+    GetFile,
+    SendDocument,
+    SendVoice,
 }
 impl Method {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::GetMe => "getMe",
             Self::GetWebhookInfo => "getWebhookInfo",
             Self::GetUpdates => "getUpdates",
             Self::SendMessage => "sendMessage",
+            Self::SetWebhook => "setWebhook",
+            Self::DeleteWebhook => "deleteWebhook",
+            Self::GetChat => "getChat",
+            Self::GetChatMember => "getChatMember",
+            Self::SetMyCommands => "setMyCommands",
+            Self::AnswerCallbackQuery => "answerCallbackQuery",
+            Self::SendChatAction => "sendChatAction",
+            Self::EditMessageText => "editMessageText",
+            Self::EditMessageReplyMarkup => "editMessageReplyMarkup",
+            Self::SendMessageDraft => "sendMessageDraft",
+            Self::SendRichMessage => "sendRichMessage",
+            Self::GetFile => "getFile",
+            Self::SendDocument => "sendDocument",
+            Self::SendVoice => "sendVoice",
         }
     }
 }
 pub type RequestFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, Error>> + Send + 'a>>;
-/// The injectable boundary used by fake transports; tests need no HTTP server
-/// and production has one fixed, verified HTTPS API origin.
-pub trait Transport: Send + Sync {
-    fn request<'a>(&'a self, token: &'a Token, method: Method, body: Value) -> RequestFuture<'a>;
+/// Bot API and file transport. Profile configuration supplies nondefault origins.
+pub struct Endpoints {
+    pub api: Url,
+    pub files: Url,
+    pub proxy: Option<Url>,
 }
 
-struct HttpsTransport {
-    client: reqwest::Client,
-}
-impl HttpsTransport {
-    fn new() -> Result<Self, Error> {
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(35))
-                .build()
-                .map_err(|_| Error::invalid("Could not initialize the Telegram connection"))?,
-        })
+impl Default for Endpoints {
+    fn default() -> Self {
+        let origin = Url::parse("https://api.telegram.org/").expect("Telegram API origin");
+        Self {
+            api: origin.clone(),
+            files: origin,
+            proxy: None,
+        }
     }
 }
-impl Transport for HttpsTransport {
+
+impl Endpoints {
+    pub fn validate(&self) -> Result<(), Error> {
+        for origin in [&self.api, &self.files] {
+            let loopback = origin.host().is_some_and(|host| match host {
+                url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(host) => host.is_loopback(),
+                url::Host::Ipv6(host) => host.is_loopback(),
+            });
+            if !(origin.scheme() == "https" || (origin.scheme() == "http" && loopback))
+                || origin.host().is_none()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+            {
+                return Err(Error::invalid("Invalid Telegram API or file origin"));
+            }
+        }
+        if self.proxy.as_ref().is_some_and(|url| {
+            !matches!(url.scheme(), "http" | "https")
+                || url.host().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+        }) {
+            return Err(Error::invalid("Invalid Telegram proxy origin"));
+        }
+        Ok(())
+    }
+}
+
+pub type FileStream = Pin<Box<dyn AsyncRead + Send>>;
+pub type FileFuture<'a> = Pin<Box<dyn Future<Output = Result<FileStream, Error>> + Send + 'a>>;
+
+pub struct Upload {
+    pub field: &'static str,
+    pub filename: String,
+    pub content_type: Option<&'static str>,
+    pub bytes: Vec<u8>,
+}
+
+pub trait Transport: Send + Sync {
+    fn request<'a>(&'a self, token: &'a Token, method: Method, body: Value) -> RequestFuture<'a>;
+
+    fn upload<'a>(
+        &'a self,
+        _token: &'a Token,
+        _method: Method,
+        _body: Value,
+        _file: Upload,
+    ) -> RequestFuture<'a> {
+        Box::pin(async { Err(Error::invalid("Telegram uploads are unavailable")) })
+    }
+
+    fn download<'a>(&'a self, _token: &'a Token, _path: &'a str) -> FileFuture<'a> {
+        Box::pin(async { Err(Error::invalid("Telegram downloads are unavailable")) })
+    }
+}
+
+struct HttpTransport {
+    client: reqwest::Client,
+    endpoints: Endpoints,
+}
+
+impl HttpTransport {
+    fn new(endpoints: Endpoints) -> Result<Self, Error> {
+        endpoints.validate()?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(35));
+        if let Some(proxy) = &endpoints.proxy {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy.clone())
+                    .map_err(|_| Error::invalid("Invalid Telegram proxy origin"))?,
+            );
+        }
+        let client = builder
+            .build()
+            .map_err(|_| Error::invalid("Could not initialize the Telegram connection"))?;
+        Ok(Self { client, endpoints })
+    }
+
+    fn endpoint(&self, token: &Token, method: Method) -> Url {
+        let mut url = self.endpoints.api.clone();
+        url.path_segments_mut()
+            .expect("validated Telegram origin")
+            .pop_if_empty()
+            .push(&format!("bot{}", token.value()))
+            .push(method.name());
+        url
+    }
+}
+
+fn request_failed(error: reqwest::Error) -> Error {
+    Error {
+        kind: ErrorKind::Retryable,
+        message: if error.is_timeout() {
+            "Telegram request timed out"
+        } else {
+            "Could not reach Telegram"
+        }
+        .into(),
+        retry_after: Some(3),
+    }
+}
+
+async fn telegram_result(mut response: Response, token: &Token) -> Result<Value, Error> {
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err(Error::invalid(
+                "Telegram reply exceeds the native safe-load limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut envelope: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("Telegram returned an unreadable reply"))?;
+    if status.is_success() && envelope.get("ok") == Some(&Value::Bool(true)) {
+        return envelope
+            .as_object_mut()
+            .and_then(|envelope| envelope.remove("result"))
+            .ok_or_else(|| Error::invalid("Telegram reply has no result"));
+    }
+    let rejection = envelope["ok"] == false
+        && envelope["error_code"].as_u64() == Some(u64::from(status.as_u16()));
+    let kind = match status.as_u16() {
+        401 if rejection => ErrorKind::Credentials,
+        409 if rejection => ErrorKind::Conflict,
+        429 if rejection => ErrorKind::RateLimited,
+        400..=499 if rejection => ErrorKind::Rejected,
+        _ => ErrorKind::Retryable,
+    };
+    let description = envelope["description"]
+        .as_str()
+        .unwrap_or("Telegram rejected the request");
+    Err(Error {
+        kind,
+        message: token.redact(description),
+        retry_after: envelope
+            .pointer("/parameters/retry_after")
+            .and_then(Value::as_u64)
+            .map(|seconds| seconds.max(1)),
+    })
+}
+
+impl Transport for HttpTransport {
     fn request<'a>(&'a self, token: &'a Token, method: Method, body: Value) -> RequestFuture<'a> {
         Box::pin(async move {
             let response = self
                 .client
-                .post(format!(
-                    "https://api.telegram.org/bot{}/{}",
-                    token.value(),
-                    method.name()
-                ))
+                .post(self.endpoint(token, method))
                 .json(&body)
                 .send()
                 .await
-                .map_err(|error| Error {
-                    kind: ErrorKind::Retryable,
-                    message: if error.is_timeout() {
-                        "Telegram request timed out"
-                    } else {
-                        "Could not reach Telegram"
-                    }
-                    .into(),
-                    retry_after: Some(3),
-                })?;
-            let status = response.status();
-            let mut response = response;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| Error {
-                kind: ErrorKind::Retryable,
-                message: "Could not read Telegram's reply".into(),
-                retry_after: Some(3),
-            })? {
-                if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                    return Err(Error::invalid(
-                        "Telegram reply exceeds the native safe-load limit",
-                    ));
+                .map_err(request_failed)?;
+            telegram_result(response, token).await
+        })
+    }
+
+    fn upload<'a>(
+        &'a self,
+        token: &'a Token,
+        method: Method,
+        body: Value,
+        file: Upload,
+    ) -> RequestFuture<'a> {
+        Box::pin(async move {
+            let fields = body
+                .as_object()
+                .ok_or_else(|| Error::invalid("Telegram upload fields must be an object"))?;
+            let mut form = multipart::Form::new();
+            for (key, value) in fields {
+                let text = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string());
+                form = form.text(key.clone(), text);
+            }
+            let mut part = multipart::Part::bytes(file.bytes).file_name(file.filename);
+            if let Some(content_type) = file.content_type {
+                part = part
+                    .mime_str(content_type)
+                    .map_err(|_| Error::invalid("Invalid Telegram upload media type"))?;
+            }
+            let response = self
+                .client
+                .post(self.endpoint(token, method))
+                .multipart(form.part(file.field, part))
+                .send()
+                .await
+                .map_err(request_failed)?;
+            telegram_result(response, token).await
+        })
+    }
+
+    fn download<'a>(&'a self, token: &'a Token, path: &'a str) -> FileFuture<'a> {
+        Box::pin(async move {
+            use futures_util::TryStreamExt;
+            let mut url = self.endpoints.files.clone();
+            {
+                let mut segments = url
+                    .path_segments_mut()
+                    .expect("validated Telegram file origin");
+                segments
+                    .pop_if_empty()
+                    .push("file")
+                    .push(&format!("bot{}", token.value()));
+                if path.len() > 2048 {
+                    return Err(Error::invalid("Invalid Telegram file reference"));
                 }
-                bytes.extend_from_slice(&chunk);
+                for part in path.split('/') {
+                    if part.is_empty()
+                        || matches!(part, "." | "..")
+                        || part.contains(['\\', '%', '?', '#'])
+                        || part.chars().any(char::is_control)
+                    {
+                        return Err(Error::invalid("Invalid Telegram file reference"));
+                    }
+                    segments.push(part);
+                }
             }
-            let envelope: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| Error::invalid("Telegram returned an unreadable reply"))?;
-            if status.is_success() && envelope.get("ok") == Some(&Value::Bool(true)) {
-                return envelope
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| Error::invalid("Telegram reply has no result"));
+            let response = self.client.get(url).send().await.map_err(request_failed)?;
+            if !response.status().is_success() {
+                return Err(Error::invalid("Could not download the Telegram file"));
             }
-            let rejection = envelope["ok"] == false
-                && envelope["error_code"].as_u64() == Some(u64::from(status.as_u16()));
-            let kind = match status.as_u16() {
-                429 if rejection => ErrorKind::RateLimited,
-                400..=499 if rejection => ErrorKind::Rejected,
-                _ => ErrorKind::Retryable,
-            };
-            let description = envelope
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Telegram rejected the request");
-            Err(Error {
-                kind,
-                message: token.redact(description),
-                retry_after: envelope
-                    .pointer("/parameters/retry_after")
-                    .and_then(Value::as_u64)
-                    .map(|seconds| seconds.max(1)),
-            })
+            let stream = response
+                .bytes_stream()
+                .map_err(|_| std::io::Error::other("Could not read the Telegram file"));
+            Ok(Box::pin(StreamReader::new(stream)) as FileStream)
         })
     }
 }
@@ -203,6 +402,15 @@ pub struct Identity {
     pub username: String,
     pub name: String,
 }
+#[derive(Debug, Clone)]
+pub struct Bot {
+    pub identity: Identity,
+    pub can_join_groups: bool,
+    pub receives_all_group_messages: bool,
+    pub topic_mode: bool,
+    pub user_topics: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Incoming {
     pub bot_id: i64,
@@ -241,12 +449,18 @@ impl Client {
         &self.token
     }
     pub fn new(token: Token) -> Result<Self, Error> {
-        Ok(Self::with_transport(token, Arc::new(HttpsTransport::new()?)))
+        Self::with_endpoints(token, Endpoints::default())
+    }
+    pub fn with_endpoints(token: Token, endpoints: Endpoints) -> Result<Self, Error> {
+        Ok(Self::with_transport(
+            token,
+            Arc::new(HttpTransport::new(endpoints)?),
+        ))
     }
     pub fn with_transport(token: Token, transport: Arc<dyn Transport>) -> Self {
         Self { transport, token }
     }
-    async fn request(
+    pub async fn request(
         &self,
         method: Method,
         body: Value,
@@ -254,7 +468,35 @@ impl Client {
     ) -> Result<Value, Error> {
         tokio::select! {biased;_=cancel.cancelled()=>Err(Error::cancelled()),result=self.transport.request(&self.token,method,body)=>result.map_err(|mut error|{error.message=self.token.redact(&error.message);error})}
     }
-    pub async fn verify(&self, cancel: &CancellationToken) -> Result<Identity, Error> {
+    pub async fn upload(
+        &self,
+        method: Method,
+        fields: Value,
+        file: Upload,
+        cancel: &CancellationToken,
+    ) -> Result<Value, Error> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::cancelled()),
+            result = self.transport.upload(&self.token, method, fields, file) => {
+                result.map_err(|mut error| { error.message = self.token.redact(&error.message); error })
+            },
+        }
+    }
+
+    pub async fn download(
+        &self,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<FileStream, Error> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::cancelled()),
+            result = self.transport.download(&self.token, path) => result,
+        }
+    }
+
+    pub async fn identify(&self, cancel: &CancellationToken) -> Result<Bot, Error> {
         let user = self.request(Method::GetMe, json!({}), cancel).await?;
         if user.get("is_bot") != Some(&Value::Bool(true)) {
             return Err(Error::invalid("This credential is not a Telegram bot"));
@@ -274,6 +516,21 @@ impl Client {
             .and_then(Value::as_str)
             .unwrap_or("Telegram")
             .to_owned();
+        Ok(Bot {
+            identity: Identity { id, username, name },
+            can_join_groups: user["can_join_groups"].as_bool().unwrap_or(false),
+            receives_all_group_messages: user["can_read_all_group_messages"]
+                .as_bool()
+                .unwrap_or(false),
+            topic_mode: user["has_topics_enabled"].as_bool().unwrap_or(false),
+            user_topics: user["allows_users_to_create_topics"]
+                .as_bool()
+                .unwrap_or(false),
+        })
+    }
+
+    pub async fn verify(&self, cancel: &CancellationToken) -> Result<Identity, Error> {
+        let identity = self.identify(cancel).await?.identity;
         let webhook = self
             .request(Method::GetWebhookInfo, json!({}), cancel)
             .await?;
@@ -286,7 +543,7 @@ impl Client {
                 "This bot has an existing webhook. Remove it in that integration or use a separate bot before connecting here.",
             ));
         }
-        Ok(Identity { id, username, name })
+        Ok(identity)
     }
     pub async fn poll(
         &self,
@@ -338,7 +595,11 @@ impl Client {
                 batch.ignored += 1;
                 continue;
             };
-            let Some(message_id) = message.get("message_id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+            let Some(message_id) = message
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+            else {
                 batch.ignored += 1;
                 continue;
             };
@@ -383,7 +644,9 @@ impl Client {
         let message_id = result
             .get("message_id")
             .and_then(Value::as_i64)
-            .filter(|id| *id > 0 && result.pointer("/chat/id").and_then(Value::as_i64) == Some(user_id))
+            .filter(|id| {
+                *id > 0 && result.pointer("/chat/id").and_then(Value::as_i64) == Some(user_id)
+            })
             .ok_or_else(|| Error::invalid("Telegram did not confirm delivery"))?;
         Ok(Receipt {
             message_id,

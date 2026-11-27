@@ -11,6 +11,7 @@ use super::{
     store::{self, OutboundPolicy, PendingDelivery, Store},
     transport::{InstallationKey, SharedReceiver},
     types::*,
+    webhook_receiver::Webhook,
 };
 use crate::{Shared, lock};
 use anyhow::{Context, Result, ensure};
@@ -85,6 +86,7 @@ pub struct State {
     accepting: bool,
     pub(super) health: Health,
     gap: bool,
+    webhook: Option<Webhook>,
 }
 
 impl State {
@@ -104,6 +106,19 @@ pub struct Ingress {
 }
 
 impl Ingress {
+    pub(super) fn name(&self) -> &str {
+        &self.slot.name
+    }
+
+    pub(super) fn attach_webhook(&self, webhook: Webhook) -> Result<(), GatewayError> {
+        let mut state = lock(&self.slot.state);
+        if !state.accepting || state.generation.as_deref() != Some(&self.generation) {
+            return Err(GatewayError::StaleConnection);
+        }
+        state.webhook = Some(webhook);
+        Ok(())
+    }
+
     pub fn connection_name(&self) -> &str {
         &self.connection
     }
@@ -543,6 +558,7 @@ impl Ingress {
         let mut state = lock(&self.slot.state);
         if state.generation.as_deref() == Some(&self.generation) {
             state.accepting = false;
+            state.webhook = None;
         }
     }
 
@@ -550,6 +566,7 @@ impl Ingress {
         let mut state = lock(&self.slot.state);
         if state.generation.as_deref() == Some(&self.generation) {
             state.generation = None;
+            state.webhook = None;
             state.accepting = false;
         }
     }
@@ -721,6 +738,7 @@ impl Host {
             self.store.save_stock(adapter, name, revision, enabled, &configuration)?;
             if let Some(state) = &mut state {
                 state.generation = None;
+                state.webhook = None;
                 state.accepting = false;
             }
         }
@@ -772,6 +790,7 @@ impl Host {
                 let mut state = lock(&previous.slot.state);
                 state.accepting = false;
                 state.generation = None;
+                state.webhook = None;
             }
             previous.stop.cancel();
             let _ = previous.task.await;
@@ -794,6 +813,7 @@ impl Host {
                 installation: None,
                 health: Health::Connecting,
                 gap: false,
+                webhook: None,
             }),
             acknowledgements: Arc::default(),
             changed: Notify::new(),
@@ -912,6 +932,7 @@ impl Host {
             self.store
                 .complete_enrollment(name, lease, &binding, &value)?;
             state.generation = None;
+            state.webhook = None;
             state.accepting = false;
         } else {
             self.store
@@ -951,6 +972,7 @@ impl Host {
                 let mut state = lock(&managed.slot.state);
                 self.store.set_connection_enabled(name, false)?;
                 state.generation = None;
+                state.webhook = None;
                 state.accepting = false;
             } else {
                 self.store.set_connection_enabled(name, false)?;
@@ -988,6 +1010,28 @@ impl Host {
         };
         slot.changed.notify_one();
         Ok(changed)
+    }
+
+    pub(super) async fn find_webhook(&self, id: &str) -> Option<(Ingress, Webhook)> {
+        let slots = self.slots.lock().await;
+        slots.values().find_map(|managed| {
+            let slot = &managed.slot;
+            let state = lock(&slot.state);
+            let webhook = state.webhook.as_ref().filter(|webhook| webhook.id == id)?;
+            if !state.accepting {
+                return None;
+            }
+            let owner = slot.owner.upgrade()?;
+            let ingress = Ingress {
+                slot: slot.clone(),
+                store: self.store.clone(),
+                connection: state.identity.clone()?,
+                generation: state.generation.clone()?,
+                installation: state.installation.clone(),
+                root: owner.library.root().to_owned(),
+            };
+            Some((ingress, webhook.clone()))
+        })
     }
 
     pub async fn bind_receiver(

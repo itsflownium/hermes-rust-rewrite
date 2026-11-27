@@ -3250,6 +3250,7 @@ dependencies = [
  "hermes-gateway-core",
  "hermes-library",
  "hermes-reliquary-plugin",
+ "hermes-telegram-plugin",
  "reqwest",
  "ring",
  "serde_json",
@@ -3274,6 +3275,8 @@ dependencies = [
  "hermes-reliquary-plugin",
  "hermes-telegram",
  "libc",
+ "ogg",
+ "opus2",
  "reqwest",
  "ring",
  "rusqlite",
@@ -3338,6 +3341,7 @@ name = "hermes-telegram"
 version = "0.2.0"
 dependencies = [
  "fs2",
+ "futures-util",
  "hermes-engine",
  "reqwest",
  "ring",
@@ -3347,6 +3351,28 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "hermes-telegram-plugin"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "hermes-gateway-core",
+ "hermes-telegram",
+ "pulldown-cmark",
+ "regex",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "unicode-segmentation",
 ]
 
 [[package]]

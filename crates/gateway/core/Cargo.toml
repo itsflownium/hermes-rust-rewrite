@@ -10,6 +10,7 @@ path = "../src/lib.rs"
 [features]
 default = []
 test-support = []
+voice-codec = ["dep:ogg", "dep:opus2"]
 reliquary = ["dep:hermes-reliquary-plugin", "hermes-reliquary-plugin/native"]
 
 [dependencies]
@@ -24,6 +25,8 @@ tokio-util = { workspace = true, features = ["io", "rt"] }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3"
+ogg = { version = "0.9.2", optional = true }
+opus2 = { version = "0.4", optional = true }
 base64 = "0.22"
 ring = "0.17"
 rusqlite = { version = "0.43", features = ["bundled"] }

@@ -1,0 +1,25 @@
+[package]
+name = "hermes-telegram-plugin"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+hermes-gateway-core = { path = "../../gateway/core", features = ["voice-codec"] }
+hermes-telegram = { path = "../../telegram" }
+pulldown-cmark = { version = "0.12", default-features = false }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { workspace = true, features = ["fs"] }
+tokio-util.workspace = true
+unicode-segmentation = "1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["multipart"] }
+hermes-gateway-core = { path = "../../gateway/core", features = ["test-support"] }
+tempfile = "3"
