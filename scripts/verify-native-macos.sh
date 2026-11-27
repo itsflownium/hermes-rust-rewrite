@@ -18,12 +18,35 @@ python=$(cd "$app/Contents/Resources/python" && pwd -P)
 test -x "$host"
 # Python plugins run in the embedded CPython; it is the only interpreter, and only the host links it.
 "$host" --version | grep -q " $python\$" || { echo "hermes-python-host does not run the bundled Python" >&2; exit 1; }
-foreign=$(find "$app/Contents" -path "$app/Contents/Resources/python" -prune -o ! -path "$host" \( -name '*.asar' -o -iname '*electron*' -o -iname '*chromium*' -o -iname '*tauri*' -o -iname '*webkit*' -o -iname '*python*' -o -iname node -o -iname node_modules -o -name '*.node' -o -name '*.py' -o -name '*.pyc' -o -name '*.html' -o -name '*.js' -o -name '*.wasm' \) -print)
+bridge="$app/Contents/Resources/whatsapp-bridge"
+modules="$bridge/node_modules"
+bridge_source="$root/crates/plugins/whatsapp/bridge"
+for asset in bridge.mjs package.json package-lock.json; do
+    cmp "$bridge/$asset" "$bridge_source/$asset"
+done
+test -f "$modules/@whiskeysockets/baileys/package.json" || {
+    echo "The bundled WhatsApp bridge is missing Baileys" >&2
+    exit 1
+}
+
+# The pinned bridge runs with an external Node.js installation.
+foreign=$(find "$app/Contents" \
+    -path "$app/Contents/Resources/python" -prune -o ! -path "$host" \
+    \( -name '*.asar' -o -iname '*electron*' -o -iname '*chromium*' \
+       -o -iname '*tauri*' -o -iname '*webkit*' -o -iname '*python*' \
+       -o \( -iname node \( ! -type d -o ! -path "$modules/*" \) \) \
+       -o -iname node.exe -o -iname 'libnode.*' -o -name '*.py' -o -name '*.pyc' \
+       -o \( ! -path "$bridge/bridge.mjs" ! -path "$modules" ! -path "$modules/*" \
+              \( -iname node_modules -o -name '*.node' -o -name '*.html' -o -name '*.js' \
+                 -o -name '*.mjs' -o -name '*.cjs' -o -name '*.wasm' \) \) \
+    \) -print)
 if [ -n "$foreign" ]; then
     echo "Unexpected interpreter, web runtime, or script in application bundle" >&2
     echo "$foreign" >&2
     exit 1
 fi
+find "$modules" -type f \( -name '*.node' -o -name '*.dylib' \) |
+    while IFS= read -r library; do codesign --verify --strict "$library"; done
 for executable in "$app/Contents/MacOS/"*; do
     file "$executable" | grep -q 'Mach-O'
     # The HTML artifact preview uses the operating system's own WKWebView
@@ -42,4 +65,4 @@ for executable in "$app/Contents/MacOS/"*; do
         exit 1
     fi
 done
-printf 'Verified native executables, signing, official icon, bundled Python, and runtime dependencies in %s\n' "$app"
+printf 'Verified native executables, signing, official icon, bundled Python, the WhatsApp bridge, and runtime dependencies in %s\n' "$app"

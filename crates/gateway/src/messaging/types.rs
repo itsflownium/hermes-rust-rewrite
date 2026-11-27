@@ -437,6 +437,11 @@ pub enum RetryScope {
     Account,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryBlock {
+    ReplyWindowClosed,
+}
+
 /// Only use Retryable when the platform definitively did not accept the request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeliveryResult {
@@ -458,6 +463,8 @@ pub enum DeliveryResult {
     /// The attachment was definitively refused without publishing the message.
     /// Only a text alternative in the stored plan can follow this result.
     AttachmentNotPublished,
+    /// A definite policy or provider eligibility refusal before publication.
+    Blocked(DeliveryBlock),
     Rejected,
     Uncertain,
 }

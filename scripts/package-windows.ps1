@@ -34,6 +34,8 @@ try {
     Copy-Item "assets/icon.ico" "$root/Hermes.ico"
     & $env:PYO3_PYTHON "scripts/reliquary-notices.py" stage "$root/Notices" "$root/Hermes.exe"
     if ($LASTEXITCODE -ne 0) { throw "Could not stage locked upstream licenses ($LASTEXITCODE)" }
+    & $env:PYO3_PYTHON "scripts/stage-whatsapp-bridge.py" "$root/whatsapp-bridge"
+    if ($LASTEXITCODE -ne 0) { throw "Could not stage the WhatsApp bridge ($LASTEXITCODE)" }
     Get-ChildItem "crates/desktop/assets/fonts" -File | Where-Object { $_.Name -match '(NOTICE|LICENSE).*\.txt$' } | Copy-Item -Destination "$root/Notices"
     # Authenticode, when a certificate is given (a .pfx path and its password).
     if ($env:WINDOWS_CERTIFICATE) {

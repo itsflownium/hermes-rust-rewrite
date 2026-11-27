@@ -146,6 +146,7 @@ pub const METHODS: &[&str] = &[
     "messaging.profile.enable",
     "messaging.profile.policy",
     "messaging.profile.pair",
+    "messaging.profile.pending_pairings",
     "messaging.profile.unpair",
 ];
 
@@ -398,7 +399,7 @@ impl Gateway {
             .route("/api/webapp/socket-ticket", post(terminal::ticket))
             .route("/api/host-terminal", get(terminal::upgrade))
             .route("/webhooks/{name}", post(webhooks::receive))
-            .route("/api/messaging/webhooks/{key}", post(messaging::webhook_receiver::receive))
+            .route("/api/messaging/webhooks/{key}", get(messaging::webhook_receiver::challenge).post(messaging::webhook_receiver::receive))
             .with_state(shared.clone());
         let stop = shared.shutdown.clone();
         let on_stop = shared.clone();
@@ -1137,6 +1138,11 @@ impl Shared {
                 let paired = self.messaging.pairing(required_string(params, "name")?,
                     required_string(params, "code")?, None).await.map_err(RpcError::internal)?;
                 Ok(json!({"paired":paired}))
+            }
+            "messaging.profile.pending_pairings" => {
+                let name = required_string(params, "name")?;
+                let pending = self.messaging.pending_pairings(name).await.map_err(RpcError::internal)?;
+                Ok(json!({"pairings":pending}))
             }
             "messaging.profile.unpair" => {
                 let removed = self.messaging.pairing(required_string(params, "name")?,

@@ -1708,6 +1708,13 @@ pub(super) fn record(
             classified.release_slot = true;
             classified
         }
+        DeliveryResult::Blocked(super::DeliveryBlock::ReplyWindowClosed)
+            if !exact_replay && receipts.is_empty() =>
+        {
+            let mut classified = RecordedEffect::with("rejected", Some("reply_window_closed"));
+            classified.release_slot = true;
+            classified
+        }
         DeliveryResult::Rejected if !exact_replay && receipts.is_empty() => {
             let mut classified = RecordedEffect::with("rejected", Some("platform_rejected"));
             classified.release_slot = true;

@@ -3252,6 +3252,7 @@ dependencies = [
  "hermes-reliquary-plugin",
  "hermes-slack-plugin",
  "hermes-telegram-plugin",
+ "hermes-whatsapp-plugin",
  "reqwest",
  "ring",
  "serde_json",
@@ -3388,6 +3389,27 @@ dependencies = [
  "hermes-telegram",
  "pulldown-cmark",
  "regex",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "hermes-whatsapp-plugin"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "hermes-engine",
+ "hermes-gateway-core",
  "reqwest",
  "ring",
  "rusqlite",

@@ -10,6 +10,8 @@ const STOCK_MESSENGERS: &[messaging::StockAdapter] = &[
     hermes_discord_plugin::STOCK_ADAPTER,
     hermes_telegram_plugin::STOCK_ADAPTER,
     hermes_slack_plugin::STOCK_ADAPTER,
+    hermes_whatsapp_plugin::LINKED_ADAPTER,
+    hermes_whatsapp_plugin::CLOUD_ADAPTER,
 ];
 
 impl Gateway {

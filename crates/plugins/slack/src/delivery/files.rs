@@ -93,6 +93,7 @@ pub(super) async fn upload(
     cancel: &CancellationToken,
 ) -> DeliveryResult {
     match step {
+        UploadStep::Single => DeliveryResult::Rejected,
         UploadStep::Begin => {
             let bytes = match ingress.reply_artifact(attempt, artifact).await {
                 Ok(bytes) if (1..=MAX_ADAPTER_FILE).contains(&bytes.len()) => bytes.len(),

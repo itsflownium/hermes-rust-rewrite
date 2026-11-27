@@ -80,6 +80,7 @@ pub enum ProvisionResource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadStep {
+    Single,
     Begin,
     Chunk { begin: u32, index: u32 },
     Finish { begin: u32, chunks: Vec<u32> },
@@ -270,6 +271,7 @@ impl EffectOperation {
             Self::Message | Self::Publish { .. } => Some(ReceiptKind::Message),
             Self::Provision { .. } => Some(ReceiptKind::Destination),
             Self::Upload { step, .. } => Some(match step {
+                UploadStep::Single => ReceiptKind::File,
                 UploadStep::Begin => ReceiptKind::UploadSession,
                 UploadStep::Chunk { .. } => ReceiptKind::UploadChunk,
                 UploadStep::Finish { .. } => ReceiptKind::File,
@@ -745,7 +747,7 @@ fn same_upload(parts: &[DeliveryPart], begin: u32, resource: &AttachmentRef) -> 
 
 fn valid_upload(previous: &[DeliveryPart], resource: &AttachmentRef, step: &UploadStep) -> bool {
     match step {
-        UploadStep::Begin => true,
+        UploadStep::Single | UploadStep::Begin => true,
         UploadStep::Chunk { begin, index } => {
             same_upload(previous, *begin, resource)
                 && !previous.iter().any(|p| match &p.effect.operation {

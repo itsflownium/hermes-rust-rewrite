@@ -30,6 +30,9 @@ if [ -f "$destination/Contents/MacOS/hermes-gateway" ]; then
 fi
 install -m 755 "$target_dir/release/hermes-python-host" "$destination/Contents/MacOS/hermes-python-host"
 scripts/bundle-python.sh "$PYO3_PYTHON" "$destination/Contents/Resources/python"
+"$PYO3_PYTHON" scripts/stage-whatsapp-bridge.py "$destination/Contents/Resources/whatsapp-bridge"
+find "$destination/Contents/Resources/whatsapp-bridge" -type f \( -name '*.node' -o -name '*.dylib' \) |
+    while IFS= read -r library; do sign "$library"; done
 host="$destination/Contents/MacOS/hermes-python-host"
 library=$(otool -L "$host" | awk '/libpython3|Python\.framework/ { print $1; exit }')
 pyver=$("$PYO3_PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engine", "crates/desktop", "crates/library", "crates/gateway", "crates/gateway/core", "crates/plugins/discord", "crates/plugins/telegram", "crates/plugins/slack", "crates/telegram", "crates/python-host", "crates/plugins/reliquary"]
+members = ["crates/engine", "crates/desktop", "crates/library", "crates/gateway", "crates/gateway/core", "crates/plugins/discord", "crates/plugins/telegram", "crates/plugins/slack", "crates/plugins/whatsapp", "crates/telegram", "crates/python-host", "crates/plugins/reliquary"]
 default-members = ["crates/desktop"]
 exclude = ["vendor"]
 resolver = "2"

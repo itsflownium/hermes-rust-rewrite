@@ -274,6 +274,14 @@ pub struct PairingChallenge {
     pub expires_at: i64,
 }
 
+#[derive(Serialize)]
+pub(crate) struct PendingPairing {
+    pub actor: String,
+    pub room: String,
+    #[serde(flatten)]
+    pub challenge: PairingChallenge,
+}
+
 pub(super) fn time_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -783,6 +791,18 @@ impl Store {
                  WHERE connection=?1 AND challenge=?2 AND authorized=0 AND expires_at>?3",
                 params![connection, code, time_ms()],
             )? != 0)
+        })
+    }
+
+    pub(super) fn pending_pairings(&self, connection: &str) -> Result<Vec<PendingPairing>> {
+        self.read(|conn| {
+            let mut query = conn.prepare("SELECT actor,room,challenge,expires_at FROM messaging_pairing
+                WHERE connection=?1 AND authorized=0 AND expires_at>?2 ORDER BY expires_at LIMIT 128")?;
+            let rows = query.query_map(params![connection,time_ms()], |row| Ok(PendingPairing {
+                actor:row.get(0)?,room:row.get(1)?,
+                challenge:PairingChallenge { code:row.get(2)?,expires_at:row.get(3)? },
+            }))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
 

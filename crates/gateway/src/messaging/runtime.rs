@@ -1029,6 +1029,16 @@ impl Host {
         Ok(changed)
     }
 
+    pub(crate) async fn pending_pairings(&self, name: &str) -> Result<Vec<super::profile::PendingPairing>> {
+        let slots = self.slots.lock().await;
+        let slot = &slots.get(name).context("No such messaging connection")?.slot;
+        let state = lock(&slot.state);
+        let connection = state.identity.as_deref().filter(|_| state.accepting)
+            .context("Connection is not verified")?;
+        ensure!(state.policy.scope.pair_direct, "Pairing is disabled");
+        self.store.pending_pairings(connection)
+    }
+
     pub(super) async fn find_webhook(&self, id: &str) -> Option<(Ingress, Webhook)> {
         let slots = self.slots.lock().await;
         slots.values().find_map(|managed| {

@@ -17,6 +17,7 @@ hermes-gateway-core = { path = "core" }
 hermes-discord-plugin = { path = "../plugins/discord" }
 hermes-telegram-plugin = { path = "../plugins/telegram" }
 hermes-slack-plugin = { path = "../plugins/slack" }
+hermes-whatsapp-plugin = { path = "../plugins/whatsapp" }
 hermes-reliquary-plugin = { path = "../plugins/reliquary", optional = true }
 tokio.workspace = true
 
