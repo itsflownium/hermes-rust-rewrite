@@ -1,27 +1,15 @@
-use super::{store, *};
-use crate::{Gateway, GatewayConfig, RunningGateway, Settings, lock};
-use axum::{
-    Json, Router,
-    body::{Body, Bytes},
-    extract::State,
-    http::header,
-    response::{IntoResponse, Response as HttpResponse},
-    routing::post,
-};
-use futures_util::{StreamExt, stream};
-use hermes_engine::{CancellationToken, Config};
+use super::{store, test_support::Model, *};
+use crate::{RunningGateway, Settings, lock};
+use hermes_engine::CancellationToken;
 use serde_json::{Value, json};
 use std::{
-    convert::Infallible,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 use tempfile::TempDir;
 use tokio::{
-    net::TcpListener,
-    sync::{Semaphore, oneshot},
-    task::JoinHandle,
+    sync::oneshot,
     time::{Instant, sleep, timeout},
 };
 
@@ -266,120 +254,6 @@ impl Adapter for Fixture {
             }
         })
     }
-}
-
-#[derive(Clone)]
-struct ModelState {
-    requests: Arc<Mutex<Vec<Value>>>,
-    steer_release: Arc<Semaphore>,
-}
-
-struct Model {
-    state: ModelState,
-    url: String,
-    task: JoinHandle<()>,
-}
-
-impl Drop for Model {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl Model {
-    async fn new() -> Self {
-        let state = ModelState {
-            requests: Arc::default(),
-            steer_release: Arc::new(Semaphore::new(0)),
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let router = Router::new()
-            .route("/v1/chat/completions", post(model))
-            .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self { state, url, task }
-    }
-
-    async fn gateway(&self, root: &Path, adapters: Vec<AdapterConfig>) -> RunningGateway {
-        let mut config = GatewayConfig::new(
-            root,
-            Config {
-                base_url: self.url.clone(),
-                model: "fixture".into(),
-                api_key: String::new(),
-            },
-        );
-        config.adapters = adapters;
-        Gateway::start(config).await.unwrap()
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        self.state.requests.lock().unwrap().clone()
-    }
-}
-
-fn delta(content: Value, finish: Option<&str>) -> String {
-    format!(
-        "data: {}\n\n",
-        json!({"choices":[{"index":0,"delta":content,"finish_reason":finish}]})
-    )
-}
-
-async fn model(State(state): State<ModelState>, Json(request): Json<Value>) -> HttpResponse {
-    state.requests.lock().unwrap().push(request.clone());
-    let last = request["messages"].as_array().unwrap().last().unwrap();
-    let text = last["content"].as_str().unwrap_or("attachment");
-    let pending = match text {
-        "hold" => Some(false),
-        "steer wait" => Some(true),
-        _ => None,
-    };
-    let body = if let Some(steer) = pending {
-        let initial = stream::once(async {
-            Ok::<_, Infallible>(Bytes::from(delta(json!({"content":"Working"}), None)))
-        });
-        let rest = stream::once(async move {
-            if steer {
-                let permit = state.steer_release.acquire().await.unwrap();
-                permit.forget();
-                Ok::<_, Infallible>(Bytes::from(delta(json!({}), Some("stop"))))
-            } else {
-                std::future::pending::<Result<Bytes, Infallible>>().await
-            }
-        });
-        Body::from_stream(initial.chain(rest))
-    } else if matches!(text, "approval" | "clarify" | "write artifact") {
-        let (name, args) = match text {
-            "approval" => ("get_current_time", json!({})),
-            "write artifact" => (
-                "write_file",
-                json!({"path":"result.txt","content":"scoped artifact"}),
-            ),
-            _ => (
-                "clarify",
-                json!({"question":"Choose a release branch","choices":["stable","preview"]}),
-            ),
-        };
-        Body::from(delta(
-            json!({"tool_calls":[{"index":0,"id":format!("{name}-id"),"type":"function","function":{
-                "name":name,"arguments":args.to_string(),
-            }}]}),
-            Some("tool_calls"),
-        ))
-    } else {
-        let output = if text == "split" {
-            "first|second".into()
-        } else if last["tool_call_id"] == "write_file-id" {
-            "saved\nMEDIA:result.txt".into()
-        } else {
-            format!("answer {text}")
-        };
-        Body::from(delta(json!({"content":output}), Some("stop")))
-    };
-    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
 fn policy() -> AccessPolicy {
@@ -1005,7 +879,7 @@ async fn controls_edit_interrupt_and_redirect_through_native_authority() {
     ))
     .await;
     applied(&gateway, "steer", "applied").await;
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
     assert_eq!(reply(&push.sent().await.attempt), "answer steered");
 
     push.push(dm("hold-stop", "a", "hold")).await;
@@ -1105,7 +979,7 @@ async fn revoked_actor_cannot_claim_queued_work_or_receive_a_reply() {
         .set_adapter_policy("fixture", AccessPolicy::default())
         .await
         .unwrap();
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
 
     status(&gateway, |s| {
         input(s, "first").is_some_and(|row| row["state"] == "done")
@@ -1531,7 +1405,7 @@ async fn progress_edits_only_its_confirmed_platform_message() {
         delivery(s, &progress_id, 0).is_some_and(|p| p["part_state"] == "sent")
     })
     .await;
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
     let response = push.sent().await;
     assert_eq!(response.attempt.delivery_id, reply_id);
     assert_eq!(

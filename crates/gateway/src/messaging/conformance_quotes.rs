@@ -350,7 +350,7 @@ async fn revoked_quote_cannot_commit_or_claim_and_does_not_pin_the_route() {
         .set_adapter_policy("fixture", changed)
         .await
         .unwrap();
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
     driver.sent().await;
     status(&gateway, |s| {
         input(s, "revoked-before-claim").is_some_and(|r| r["state"] == "refused")

@@ -109,7 +109,7 @@ impl Store {
     }
 }
 
-pub(super) fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
+pub fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO messaging_routes(id,connection,room) VALUES (?1,?2,?3)",
         params![
@@ -154,6 +154,10 @@ pub(super) fn share_conversation(
     ensure!(
         destination.connection == binding.connection && destination.id != binding.id,
         "Messaging session binding must stay within one verified account"
+    );
+    ensure!(
+        !destination.is_background() && !binding.is_background(),
+        "A background job has its own session"
     );
     let current = tx
         .query_row(

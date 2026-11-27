@@ -55,6 +55,13 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + '
     tokio::task::spawn_blocking(work).await.map_err(RpcError::internal)?.map_err(RpcError::internal)
 }
 
+pub(super) async fn model_choices(config: hermes_engine::Config) -> (Vec<String>, Option<String>) {
+    match hermes_engine::models::discover(config.clone()).await {
+        Ok(models) => (models.into_iter().map(|model| model.id).collect(), None),
+        Err(error) => (vec![config.model], Some(format!("{error:#}"))),
+    }
+}
+
 fn epoch(stamp: &str) -> f64 {
     chrono::DateTime::parse_from_rfc3339(stamp).map_or(0.0, |at| at.timestamp_millis() as f64 / 1000.0)
 }
@@ -235,10 +242,7 @@ impl Shared {
             }
             "model.options" => {
                 let config = self.provider.clone();
-                let (listed, warning) = match hermes_engine::models::discover(config.clone()).await {
-                    Ok(models) => (models.into_iter().map(|model| model.id).collect(), None),
-                    Err(error) => (vec![config.model.clone()], Some(format!("{error:#}"))),
-                };
+                let (listed, warning) = model_choices(config.clone()).await;
                 Ok(json!({"providers":[{"slug":"current","name":config.base_url,"total_models":listed.len(),"models":listed,"is_current":true,"api_url":config.base_url,"authenticated":true,"warning":warning}],"model":config.model,"provider":"current"}))
             }
             "setup.status" => {

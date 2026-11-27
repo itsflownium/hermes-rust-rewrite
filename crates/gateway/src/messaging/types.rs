@@ -18,6 +18,10 @@ pub const CONTRACT_VERSION: u32 = 1;
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Live feedback attached to an execution. The turn token is cancelled on
+/// settlement. No feedback is stored or replayed as a delivery effect.
+pub type FirstToolFeedback = Arc<dyn Fn(CancellationToken) + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
     pub text_intake: bool,
@@ -65,6 +69,11 @@ pub struct AdapterConfig {
 
 pub trait AdapterFactory: Send + Sync {
     fn descriptor(&self) -> Descriptor;
+
+    /// Owner-facing verification diagnostics. Only include public account
+    /// identifiers and fixed status values.
+    fn verification_status(&self) -> Option<serde_json::Value> { None }
+
     /// Authenticate the configured account and return its stable platform ID.
     fn connect(
         &self,
@@ -98,6 +107,11 @@ pub struct VerifiedAdapter {
 }
 
 pub trait Adapter: Send + Sync {
+    /// Some transports must verify an additional authenticated session before work can start.
+    fn initial_transport_ready(&self) -> bool {
+        true
+    }
+
     /// Installation scope verified as part of this authenticated connection.
     fn verified_installation(&self) -> Option<VerifiedInstallation> {
         None
@@ -111,8 +125,27 @@ pub trait Adapter: Send + Sync {
         cancel: CancellationToken,
     ) -> AdapterFuture<'_, ConnectionFailure>;
 
+    /// Optionally bind live, best-effort feedback to this input before execution.
+    /// The returned callback runs once on the first tool call and must return promptly.
+    fn first_tool_feedback(
+        &self,
+        _ingress: Ingress,
+        _event: &InboundEvent,
+    ) -> Option<FirstToolFeedback> {
+        None
+    }
+
     /// Render the committed intent into bounded platform operations without network effects.
     fn prepare(&self, intent: &DeliveryIntent) -> Result<Vec<DeliveryPart>, PreparationFailure>;
+
+    /// Render with read access to this connection's committed delivery provenance.
+    fn prepare_with_ingress(
+        &self,
+        intent: &DeliveryIntent,
+        _ingress: &Ingress,
+    ) -> Result<Vec<DeliveryPart>, PreparationFailure> {
+        self.prepare(intent)
+    }
 
     /// Execute a single platform operation. The gateway records its attempt before calling.
     fn send(
@@ -251,7 +284,7 @@ impl InboundBody {
     pub(super) fn is_control(&self) -> bool {
         match self {
             Self::Control(_) => true,
-            Self::Command(super::Command::UseSkill { .. }) => false,
+            Self::Command(super::Command::UseSkill { .. } | super::Command::Background { .. }) => false,
             Self::Command(_) => true,
             _ => false,
         }
@@ -397,6 +430,9 @@ pub struct UncertainDelivery {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryScope {
+    /// Defer this exact outbox part. The adapter can enforce its own
+    /// provider bucket across requests before dispatch.
+    Part,
     Destination,
     Account,
 }
@@ -419,6 +455,9 @@ pub enum DeliveryResult {
     Submitted,
     /// Evidence that the requested edit was definitively not published.
     EditNotPublished,
+    /// The attachment was definitively refused without publishing the message.
+    /// Only a text alternative in the stored plan can follow this result.
+    AttachmentNotPublished,
     Rejected,
     Uncertain,
 }

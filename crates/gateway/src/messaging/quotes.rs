@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc};
 
 const MAX_QUOTE_BYTES: usize = 8 * 1024;
+pub const MAX_SCROLLBACK_BYTES: usize = 12 * 1024;
+pub const MAX_SCROLLBACK_MESSAGE_BYTES: usize = 3 * 1024;
+const MAX_SCROLLBACK_MESSAGES: u8 = 20;
 
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_quoted_context (
@@ -42,6 +45,33 @@ impl QuoteReference {
     }
 }
 
+/// Read older content relative to this exact trigger and destination.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrollbackReference {
+    pub before: QuoteReference,
+    pub reply: Option<QuoteReference>,
+    pub count: u8,
+}
+
+impl ScrollbackReference {
+    pub(super) fn valid(&self, event: &InboundEvent) -> bool {
+        self.before.valid()
+            && self.before.room == event.room
+            && event.reply_anchor.as_deref() == Some(self.before.message_id.as_str())
+            && (1..=MAX_SCROLLBACK_MESSAGES).contains(&self.count)
+            && self.reply.as_ref().is_none_or(|reply| {
+                reply.valid()
+                    && reply.room == self.before.room
+                    && reply.message_id != self.before.message_id
+            })
+    }
+}
+
+pub struct ScrollbackQuote {
+    pub source: QuoteReference,
+    pub text: String,
+}
+
 /// Result of the adapter's scoped provider lookup. The returned source must
 /// come from the authenticated lookup, rather than echoing request parameters.
 pub enum QuoteLookup {
@@ -50,6 +80,10 @@ pub enum QuoteLookup {
         text: String,
     },
     Unavailable,
+    Scrollback {
+        messages: Vec<hermes_engine::ChannelHistoryMessage>,
+        quote: Option<ScrollbackQuote>,
+    },
 }
 
 /// Quotation and any contextual cursor observed during the same provider read.
@@ -74,11 +108,67 @@ struct QuoteContext {
     binding: QuoteBinding,
     /// None is an explicit provider report of unavailable context.
     text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scrollback: Option<StoredScrollback>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredScrollback {
+    reply: Option<String>,
+    messages: Vec<hermes_engine::ChannelHistoryMessage>,
 }
 
 pub(super) struct QuoteCommit {
     context: QuoteContext,
     advance: Option<Advance>,
+}
+
+fn context_payload(
+    source: &QuoteReference,
+    expected: Option<ScrollbackReference>,
+    result: QuoteLookup,
+) -> Result<(Option<String>, Option<StoredScrollback>), GatewayError> {
+    let valid_text = |text: &str| text.len() <= MAX_QUOTE_BYTES && !text.contains('\0');
+    match (expected, result) {
+        (
+            None,
+            QuoteLookup::Found {
+                source: actual,
+                text,
+            },
+        ) if actual == *source && valid_text(&text) => Ok((Some(text), None)),
+        (None, QuoteLookup::Unavailable) => Ok((None, None)),
+        (Some(expected), QuoteLookup::Scrollback { messages, quote }) => {
+            let mut ids = std::collections::BTreeSet::new();
+            if messages.len() > usize::from(expected.count)
+                || messages.iter().any(|entry| {
+                    !valid_id(&entry.message_id)
+                        || !valid_id(&entry.author_id)
+                        || entry.message_id == source.message_id
+                        || !ids.insert(&entry.message_id)
+                        || entry.text.len() > MAX_SCROLLBACK_MESSAGE_BYTES
+                        || entry.text.contains('\0')
+                })
+                || messages.iter().map(|entry| entry.text.len()).sum::<usize>()
+                    > MAX_SCROLLBACK_BYTES
+            {
+                return Err(GatewayError::Invalid);
+            }
+            let text = match quote {
+                Some(quote)
+                    if expected.reply.as_ref() == Some(&quote.source)
+                        && valid_text(&quote.text) =>
+                {
+                    Some(quote.text)
+                }
+                None => None,
+                _ => return Err(GatewayError::Invalid),
+            };
+            let reply = expected.reply.map(|reply| reply.message_id);
+            Ok((text, Some(StoredScrollback { reply, messages })))
+        }
+        _ => Err(GatewayError::Invalid),
+    }
 }
 
 impl QuoteBinding {
@@ -91,6 +181,7 @@ struct QuoteRead {
     event: InboundEvent,
     source: QuoteReference,
     binding: QuoteBinding,
+    scrollback: Option<ScrollbackReference>,
 }
 
 enum Readiness {
@@ -246,7 +337,7 @@ impl Ingress {
         ))
     }
 
-    pub(super) fn allows_quote(
+    pub fn allows_quote(
         &self,
         state: &State,
         event: &InboundEvent,
@@ -308,8 +399,12 @@ impl Ingress {
         if staged.token != token {
             return Err(GatewayError::Forbidden);
         }
-        let PreparationPurpose::Quote(source) = staged.purpose else {
-            return Err(GatewayError::Unsupported);
+        let (source, scrollback) = match staged.purpose {
+            PreparationPurpose::Quote(source) => (source, None),
+            PreparationPurpose::Scrollback(scrollback) => {
+                (scrollback.before.clone(), Some(scrollback))
+            }
+            _ => return Err(GatewayError::Unsupported),
         };
         if staged.receipt.disposition != Disposition::Deferred {
             if !db(self.store.quote_transport_matches(
@@ -340,6 +435,7 @@ impl Ingress {
             event,
             source,
             binding,
+            scrollback,
         }))
     }
 
@@ -425,11 +521,15 @@ impl Ingress {
                     .quote_binding(state, &event, &read.binding.route, &read.source)?
                     .as_ref()
                     != Some(&read.binding)
-                    || matches!(&looked_up, Err(GatewayError::Forbidden))
                 {
                     Err(Disposition::Forbidden)
                 } else {
-                    scope.route_candidate(&state.policy, &event, true)?
+                    match &looked_up {
+                        Err(GatewayError::Forbidden) => Err(Disposition::Forbidden),
+                        Err(GatewayError::Invalid) => Err(Disposition::Invalid),
+                        Err(GatewayError::Unsupported) => Err(Disposition::Unsupported),
+                        _ => scope.route_candidate(&state.policy, &event, true)?,
+                    }
                 };
                 let quote = if decision.is_ok() {
                     let QuoteHydration {
@@ -439,7 +539,10 @@ impl Ingress {
                     } = looked_up?;
                     if let Some(message) = message {
                         if !matches!(&event.body, InboundBody::Message(original)
-                            if original.text.is_empty() && original.attachments.is_empty())
+                            if original.attachments.is_empty()
+                                && (original.text.is_empty() || message.text == original.text
+                                    || message.text.strip_prefix(&original.text)
+                                        .is_some_and(|more| more.starts_with('\n'))))
                         {
                             return Err(GatewayError::Conflict);
                         }
@@ -452,23 +555,13 @@ impl Ingress {
                     if let Some(advance) = &mut advance {
                         advance.stream = read.binding.position(&advance.stream)?;
                     }
-                    let text = match quote {
-                        QuoteLookup::Found { source, text } => {
-                            if source != read.source
-                                || text.len() > MAX_QUOTE_BYTES
-                                || text.contains('\0')
-                            {
-                                return Err(GatewayError::Invalid);
-                            }
-                            Some(text)
-                        }
-                        QuoteLookup::Unavailable => None,
-                    };
+                    let (text, scrollback) = context_payload(&read.source, read.scrollback, quote)?;
                     Some(QuoteCommit {
                         context: QuoteContext {
                             source: read.source,
                             binding: read.binding,
                             text,
+                            scrollback,
                         },
                         advance,
                     })
@@ -548,7 +641,7 @@ impl Ingress {
 
     /// Pin the logical input, not its content, across scheduling. The engine
     /// rechecks just before the provider sees the ephemeral context.
-    pub(super) fn quote_context_source(
+    pub(super) fn prepared_context_source(
         &self,
         state: &State,
         event: &InboundEvent,
@@ -564,9 +657,16 @@ impl Ingress {
                     .checked_quote(state, &event, &route)?
                     .ok_or(GatewayError::Forbidden)
             })?;
-            Ok(hermes_engine::ChannelQuote {
-                message_id: quote.source.message_id,
-                text: quote.text,
+            let (reply, scrollback) = match quote.scrollback {
+                Some(history) => (history.reply, history.messages),
+                None => (Some(quote.source.message_id), Vec::new()),
+            };
+            Ok(hermes_engine::ChannelContext {
+                quote: reply.map(|message_id| hermes_engine::ChannelQuote {
+                    message_id,
+                    text: quote.text,
+                }),
+                scrollback,
             })
         })))
     }

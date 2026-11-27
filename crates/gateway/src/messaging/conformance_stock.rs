@@ -704,7 +704,7 @@ async fn deferred_native_result_survives_restart_and_is_claimed_once() {
         )
         .await
         .unwrap();
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
     status(&gateway, |s| {
         input(s, "question").is_some_and(|row| row["state"] == "done")
     })
@@ -818,7 +818,8 @@ async fn wake_only_recovers_new_work_without_a_message_send() {
         ingress.wake("second".into()).await.unwrap().disposition,
         Disposition::Accepted
     );
-    model.state.steer_release.add_permits(2);
+    model.release_waiting_turn();
+    model.release_waiting_turn();
     status(&gateway, |s| {
         ["first", "second"]
             .iter()

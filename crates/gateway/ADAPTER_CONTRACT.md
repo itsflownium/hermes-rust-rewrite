@@ -1,6 +1,6 @@
 # Gateway adapter contract v1
 
-Mercury's gateway owns the lifetime of a channel conversation from the first authenticated event to the last recorded delivery. A stock messaging plugin is a bundled adapter with its own platform descriptor, configuration and connection factory. The native profile owner can enable each stock plugin independently.
+Mercury's gateway owns the lifetime of a channel conversation from the first authenticated event to the last recorded delivery. A stock messaging plugin is a separate Rust workspace crate with its own platform descriptor, configuration and connection factory. The gateway owns the shared adapter contract and registers bundled stock plugins. The native profile owner can enable each stock plugin independently.
 
 The core polling and push conformance suite establishes the foundation. Expand and prove the [shared stock-plugin requirements](#shared-requirements-for-stock-plugins) before implementing any stock plugin. Each plugin passes its acceptance gate in the [messaging implementation order](../../BACKEND_PARITY_PLAN.md#messaging-implementation-order).
 

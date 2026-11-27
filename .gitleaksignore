@@ -1,0 +1,2 @@
+# Cargo package names matched across two dependency lines in the original Discord lockfile.
+9fec5a6d0a044009f4fbc7dd58e7877887d1d57a:Cargo.lock:generic-api-key:4230

@@ -207,7 +207,7 @@ async fn protected_reply_holds_after_trust_revocation_even_if_owner_relaxes_poli
         .update_delivery_protection(event.room.clone(), None)
         .await
         .unwrap();
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
 
     status(&gateway, |s| {
         s["deliveries"].as_array().unwrap().iter().any(|part| {

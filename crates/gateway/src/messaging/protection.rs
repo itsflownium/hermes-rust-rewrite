@@ -151,7 +151,7 @@ impl Ingress {
         }))?
     }
 
-    pub(super) fn delivery_protection(
+    pub fn delivery_protection(
         &self,
         policy: &AccessPolicy,
         room: &Room,

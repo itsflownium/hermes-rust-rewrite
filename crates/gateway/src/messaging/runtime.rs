@@ -1,10 +1,13 @@
 use super::{
-    EffectTransportRef, EffectVisibility, acknowledgements::Acknowledgements, effects::valid_effect_plan,
+    EffectTransportRef, EffectVisibility, acknowledgements::Acknowledgements,
+    effects::valid_effect_plan,
     profile::{
         AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
         VerifiedInstallation,
     },
     sessions,
+    stock::{StockAdapter, StockConfiguration, StockConnection},
+    storage::AdapterStorage,
     store::{self, OutboundPolicy, PendingDelivery, Store},
     transport::{InstallationKey, SharedReceiver},
     types::*,
@@ -24,12 +27,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const MAX_TEXT: usize = 256 * 1024;
+pub const MAX_TEXT: usize = 256 * 1024;
 pub(super) const MAX_BATCH: usize = 100;
 const MAX_PARTS: usize = 128;
 const POLL: Duration = Duration::from_millis(100);
 
-pub(crate) fn valid_id(value: &str) -> bool {
+pub fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
 }
 
@@ -37,11 +40,11 @@ fn transport_scope(installation: Option<&VerifiedInstallation>) -> Result<String
     installation.map_or_else(|| Ok(String::new()), |proof| store::key("transport-scope", proof))
 }
 
-pub(super) fn valid_input_id(value: &str) -> bool {
+pub fn valid_input_id(value: &str) -> bool {
     valid_id(value) && !super::profile::resource_event_id(value) && !super::observations::is_observation(value)
 }
 
-pub(super) fn valid_advance(advance: Option<&Advance>) -> bool {
+pub fn valid_advance(advance: Option<&Advance>) -> bool {
     let token = |value: &str| !value.is_empty() && value.len() <= 64 * 1024 && !value.contains('\0');
     advance.is_none_or(|advance| {
         valid_id(&advance.stream)
@@ -54,6 +57,7 @@ pub(crate) struct Host {
     store: Arc<Store>,
     slots: AsyncMutex<BTreeMap<String, Managed>>,
     factories: Mutex<BTreeMap<String, Arc<dyn AdapterFactory>>>,
+    stock: BTreeMap<&'static str, StockAdapter>,
 }
 
 struct Managed {
@@ -65,20 +69,26 @@ struct Managed {
 struct Slot {
     name: String,
     descriptor: Descriptor,
+    owner: Weak<Shared>,
     state: Mutex<State>,
     acknowledgements: Arc<Mutex<Acknowledgements>>,
     changed: Notify,
 }
 
-pub(super) struct State {
+pub struct State {
     pub policy: AccessPolicy,
     pub(super) revision: i64,
+    pub(super) evidence_epoch: u64,
     generation: Option<String>,
     identity: Option<String>,
     installation: Option<VerifiedInstallation>,
     accepting: bool,
-    health: Health,
+    pub(super) health: Health,
     gap: bool,
+}
+
+impl State {
+    pub fn revision(&self) -> i64 { self.revision }
 }
 
 /// The only host handle a connected adapter receives. Its generation is
@@ -94,15 +104,25 @@ pub struct Ingress {
 }
 
 impl Ingress {
+    pub fn connection_name(&self) -> &str {
+        &self.connection
+    }
+
+    /// Storage for bundled adapters that update their protocol state in the
+    /// same transaction as gateway receipts and checkpoints.
+    pub fn storage(&self) -> AdapterStorage<'_> {
+        AdapterStorage::new(&self.store, &self.connection)
+    }
+
     pub fn installation(&self) -> Option<&VerifiedInstallation> {
         self.installation.as_ref()
     }
 
-    pub(super) fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
-    pub(super) fn checked<T>(
+    pub fn checked<T>(
         &self,
         accepting: bool,
         action: impl FnOnce(&State) -> Result<T, GatewayError>,
@@ -113,6 +133,19 @@ impl Ingress {
             return Err(GatewayError::StaleConnection);
         }
         action(&state)
+    }
+
+    pub(super) fn apply_evidence_invalidation(
+        &self,
+        invalidate: impl FnOnce() -> Result<(), GatewayError>,
+    ) -> Result<(), GatewayError> {
+        let mut state = lock(&self.slot.state);
+        if state.generation.as_deref() != Some(&self.generation) {
+            return Err(GatewayError::StaleConnection);
+        }
+        invalidate()?;
+        state.evidence_epoch = state.evidence_epoch.wrapping_add(1);
+        Ok(())
     }
 
     pub(super) fn acknowledgements(&self) -> Arc<Mutex<Acknowledgements>> {
@@ -166,11 +199,55 @@ impl Ingress {
         .await
     }
 
-    pub(super) fn notify(&self) {
+    pub fn notify(&self) {
         self.slot.changed.notify_one();
     }
 
-    pub(super) fn transport_scope(&self) -> Result<String, GatewayError> {
+    /// Resolve a native stop or correction against the currently owned turn.
+    pub async fn active_execution(&self, room: &Room, sender: &Sender) -> Result<Option<u64>, GatewayError> {
+        let session = self.checked(true, |state| {
+            if !self.authorize_operator(&state.policy, room, sender)? {
+                return Err(GatewayError::Forbidden);
+            }
+            let event = InboundEvent { id: "active-execution".into(), room: room.clone(), sender: sender.clone(),
+                reply_anchor: None, mentioned: true, body: InboundBody::Command(super::Command::Status) };
+            let Ok(route) = self.route_event(&state.policy, &event)? else { return Err(GatewayError::Forbidden) };
+            let Some(route) = db(self.store.route(&route.id))?.filter(|route| !route.blocked) else {
+                return Ok(None);
+            };
+            let route = db(self.store.conversation(&route))?;
+            Ok(route.session.filter(|_| !route.blocked))
+        })?;
+        let Some(id) = session else { return Ok(None) };
+        let owner = self.slot.owner.upgrade().ok_or(GatewayError::StaleConnection)?;
+        let session = owner.sessions.lock().await.get(&id).cloned();
+        self.checked(true, |_| Ok(session.and_then(|session| {
+            let view = lock(&session.view);
+            view.running.then_some(view.generation)
+        })))
+    }
+
+    pub fn report_transport_ready(&self, ready: bool) -> Result<(), GatewayError> {
+        let mut state = lock(&self.slot.state);
+        if !state.accepting || state.generation.as_deref() != Some(self.generation.as_str()) {
+            return Err(GatewayError::StaleConnection);
+        }
+        state.health = if ready { Health::Ready } else { Health::Connecting };
+        drop(state);
+        self.notify();
+        Ok(())
+    }
+
+    pub(super) fn model_provider_scope(&self) -> Result<String, GatewayError> {
+        let owner = self.slot.owner.upgrade().ok_or(GatewayError::StaleConnection)?;
+        db(store::key("channel-model-provider", &(
+            owner.provider.base_url.trim().trim_end_matches('/'),
+            owner.provider.api_key.trim(),
+            owner.provider.model.as_str(),
+        )))
+    }
+
+    pub fn transport_scope(&self) -> Result<String, GatewayError> {
         db(transport_scope(self.installation()))
     }
 
@@ -182,7 +259,7 @@ impl Ingress {
         db(store::key(kind, &(scope, value)))
     }
 
-    pub(super) fn scoped_advance(&self, advance: Option<Advance>) -> Result<Option<Advance>, GatewayError> {
+    pub fn scoped_advance(&self, advance: Option<Advance>) -> Result<Option<Advance>, GatewayError> {
         advance.map(|mut advance| {
             advance.stream = self.scoped_transport_key("checkpoint-stream", &advance.stream)?;
             Ok(advance)
@@ -237,7 +314,7 @@ impl Ingress {
         Ok(result)
     }
 
-    pub(super) fn route_event(
+    pub fn route_event(
         &self,
         policy: &AccessPolicy,
         event: &InboundEvent,
@@ -245,7 +322,7 @@ impl Ingress {
         self.route_candidate(policy, event, false)
     }
 
-    pub(super) fn route_candidate(
+    pub fn route_candidate(
         &self,
         policy: &AccessPolicy,
         event: &InboundEvent,
@@ -312,6 +389,11 @@ impl Ingress {
                 if !command.valid() {
                     return Ok(Err(Disposition::Invalid));
                 }
+                if command.uses_scoped_grant()
+                    && !policy.allows_scoped_command(&event.room, &sender)
+                {
+                    return Ok(Err(Disposition::Forbidden));
+                }
                 if let super::Command::UseSkill { skill, .. } = command
                     && (!room.tools || !policy.turn_policy(&event.room).skills.is_some_and(|skills| skills.contains(skill)))
                 {
@@ -327,6 +409,15 @@ impl Ingress {
                 Err(error) => return Err(error),
             }
         }
+        if matches!(event.body, InboundBody::Command(super::Command::Background { .. })) {
+            if !caps.text_delivery || preparing {
+                return Ok(Err(Disposition::Unsupported));
+            }
+            if event.reply_anchor.is_some() {
+                return Ok(Err(Disposition::Invalid));
+            }
+            return self.background_route(&event.room, &sender.id, &event.id).map(Ok);
+        }
         let participant = room.per_participant.then_some(sender.id.as_str());
         let route = db(store::Route::new(
             &self.connection,
@@ -337,6 +428,62 @@ impl Ingress {
             Some(source) => db(source.scope_route(route)).map(Ok),
             None => Ok(Ok(route)),
         }
+    }
+
+    /// Repeat the host's exact attempt checks after a provider preflight or
+    /// file read and immediately before dispatch.
+    pub async fn recheck_send(&self, attempt: &SendAttempt) -> Result<(), GatewayError> {
+        self.recheck_send_destination(attempt, &attempt.payload.room).await
+    }
+
+    pub async fn recheck_send_destination(
+        &self,
+        attempt: &SendAttempt,
+        destination: &Room,
+    ) -> Result<(), GatewayError> {
+        let (scope, attempt, destination) = (self.clone(), attempt.clone(), destination.clone());
+        blocking(move || scope.checked(true, |state| {
+            let pending = db(scope.store.delivery_for_recheck(&scope.connection, &scope.generation, &attempt))?
+                .ok_or(GatewayError::Forbidden)?;
+            if !delivery_authorized(&scope, state, &pending)? {
+                return Err(GatewayError::Forbidden);
+            }
+            let policy = outbound_policy(&scope, state, &pending, attempt.payload.effect.transport.as_ref())?;
+            if !db(scope.store.recheck(&scope.connection, &scope.generation, &pending, &attempt, &policy))? {
+                return Err(GatewayError::Forbidden);
+            }
+            let original = &pending.intent.room;
+            if destination == *original {
+                return Ok(());
+            }
+            if store::Route::is_background_id(&pending.route) {
+                return Err(GatewayError::Forbidden);
+            }
+            let confirmed_thread = original.thread.is_none()
+                && destination.chat == original.chat
+                && destination.kind == original.kind
+                && attempt.effect.dependencies.iter().any(|(_, receipt)| {
+                    receipt.kind == super::ReceiptKind::Destination
+                        && destination.thread.as_deref() == Some(&receipt.id)
+                });
+            if !confirmed_thread || state.policy.room_policy(&destination).is_none() {
+                return Err(GatewayError::Forbidden);
+            }
+            if let Some(sender) = &pending.sender
+                && !scope.authorize_sender(&state.policy, &destination, sender)?
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            scope.check_delivery_protection(
+                &state.policy, &destination, &pending.intent.id, attempt.payload.effect.protection.as_deref(),
+            )?;
+            if !db(scope.store.read(|db| store::eligible_consent(
+                db, &scope.connection, &destination, attempt.payload.effect.consent_required,
+            )))? {
+                return Err(GatewayError::Forbidden);
+            }
+            Ok(())
+        })).await
     }
 
     /// List attempts from this authenticated account that need platform evidence.
@@ -437,11 +584,11 @@ fn valid_control(control: &Control) -> bool {
     }
 }
 
-pub(super) fn db<T>(result: Result<T>) -> Result<T, GatewayError> {
+pub fn db<T>(result: Result<T>) -> Result<T, GatewayError> {
     result.map_err(|_| GatewayError::TemporarilyUnavailable)
 }
 
-pub(super) async fn blocking<T: Send + 'static>(
+pub async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, GatewayError> + Send + 'static,
 ) -> Result<T, GatewayError> {
     tokio::task::spawn_blocking(f)
@@ -450,18 +597,50 @@ pub(super) async fn blocking<T: Send + 'static>(
 }
 
 impl Host {
-    pub fn open(root: &Path, audio: Option<Arc<dyn super::AudioService>>) -> Result<Self> {
-        Ok(Self {
-            store: Arc::new(Store::open_with_audio(root, audio)?),
-            slots: AsyncMutex::default(),
-            factories: Mutex::default(),
+    pub fn open(
+        root: &Path, audio: Option<Arc<dyn super::AudioService>>, adapters: Vec<StockAdapter>,
+    ) -> Result<Self> {
+        let mut stock = BTreeMap::new();
+        for adapter in adapters {
+            adapter.validate()?;
+            ensure!(stock.insert(adapter.platform, adapter).is_none(), "Duplicate stock messaging adapter");
+        }
+        let store = Arc::new(Store::open_with_audio(root, audio)?);
+        for adapter in stock.values().copied() {
+            store.install_stock(adapter)?;
+        }
+        Ok(Self { store, slots: AsyncMutex::default(), factories: Mutex::default(), stock })
+    }
+
+    pub(crate) fn stock_method<'a>(&self, method: &'a str) -> Option<(StockAdapter, &'a str)> {
+        let (platform, operation) = method.strip_prefix("messaging.profile.")?.rsplit_once('.')?;
+        if !matches!(operation, "list" | "create" | "update") {
+            return None;
+        }
+        self.stock.get(platform).copied().map(|adapter| (adapter, operation))
+    }
+
+    pub(crate) fn stock_methods(&self) -> impl Iterator<Item = String> + '_ {
+        self.stock.keys().flat_map(|platform| {
+            ["list", "create", "update"].map(|operation| format!("messaging.profile.{platform}.{operation}"))
         })
+    }
+
+    fn has_stock_settings(&self, name: &str) -> Result<bool> {
+        let Some(connection) = self.store.connection_setting(name)? else { return Ok(false) };
+        let Some(adapter) = self.stock.get(connection.platform.as_str()) else { return Ok(false) };
+        Ok(self.store.stock_settings(*adapter, name)?.is_some())
     }
 
     pub fn validate(config: &AdapterConfig) -> Result<Descriptor> {
         let descriptor = config.factory.descriptor();
+        Self::validate_descriptor(&config.name, &descriptor)?;
+        Ok(descriptor)
+    }
+
+    fn validate_descriptor(name: &str, descriptor: &Descriptor) -> Result<()> {
         ensure!(
-            valid_id(&config.name) && valid_id(&descriptor.platform),
+            valid_id(name) && valid_id(&descriptor.platform),
             "Invalid messaging adapter identity"
         );
         ensure!(
@@ -476,7 +655,7 @@ impl Host {
             },
             "Gateway adapters require text intake and delivery or wake-only capability"
         );
-        Ok(descriptor)
+        Ok(())
     }
 
     pub async fn configure(&self, owner: &Arc<Shared>, config: AdapterConfig) -> Result<()> {
@@ -496,6 +675,8 @@ impl Host {
         let descriptor = Self::validate(&config)?;
         let mut slots = self.slots.lock().await;
         ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
+        ensure!(!self.has_stock_settings(&config.name)?,
+            "Use the owner-managed settings for this messaging connection");
         let mut saved =
             self.store
                 .register_connection(&config.name, &descriptor.platform, &config.policy)?;
@@ -519,6 +700,63 @@ impl Host {
         self.activate(owner, &mut slots, config.factory, descriptor, saved)
             .await;
         Ok(())
+    }
+
+    pub(crate) async fn save_stock(
+        &self,
+        owner: &Arc<Shared>,
+        adapter: StockAdapter,
+        name: &str,
+        revision: Option<u64>,
+        enabled: bool,
+        configuration: StockConfiguration,
+    ) -> Result<StockConnection> {
+        let descriptor = configuration.factory.descriptor();
+        Self::validate_descriptor(name, &descriptor)?;
+        ensure!(descriptor.platform == adapter.platform, "Invalid stock messaging adapter identity");
+        let mut slots = self.slots.lock().await;
+        ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
+        {
+            let mut state = revision.and_then(|_| slots.get(name)).map(|managed| lock(&managed.slot.state));
+            self.store.save_stock(adapter, name, revision, enabled, &configuration)?;
+            if let Some(state) = &mut state {
+                state.generation = None;
+                state.accepting = false;
+            }
+        }
+        let connection = self.store.connection_setting(name)?.context("Messaging connection is unavailable")?;
+        lock(&self.factories).insert(name.to_owned(), configuration.factory.clone());
+        self.activate(owner, &mut slots, configuration.factory, descriptor, connection.clone()).await;
+        Ok(StockConnection { connection, settings: configuration.settings })
+    }
+
+    pub(crate) async fn restore_stock(&self, owner: &Arc<Shared>) -> Result<()> {
+        let mut slots = self.slots.lock().await;
+        for adapter in self.stock.values().copied() {
+            for (name, settings) in self.store.stock_connections(adapter)? {
+                let mut connection = self.store.connection_setting(&name)?.context("Messaging connection is unavailable")?;
+                let configuration = (adapter.configure)(owner.library.root(), settings)?;
+                let descriptor = configuration.factory.descriptor();
+                Self::validate_descriptor(&name, &descriptor)?;
+                ensure!(connection.platform == descriptor.platform && descriptor.platform == adapter.platform,
+                    "Invalid saved messaging connection platform");
+                if connection.policy != configuration.policy {
+                    connection.revision = self.store.set_connection_policy(&name, &configuration.policy)? as u64;
+                    connection.policy = configuration.policy;
+                }
+                lock(&self.factories).insert(name, configuration.factory.clone());
+                self.activate(owner, &mut slots, configuration.factory, descriptor, connection).await;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stock_connections(&self, adapter: StockAdapter) -> Result<Vec<StockConnection>> {
+        let _slots = self.slots.lock().await;
+        self.store.stock_connections(adapter)?.into_iter().map(|(name, settings)| {
+            let connection = self.store.connection_setting(&name)?.context("Messaging connection is unavailable")?;
+            Ok(StockConnection { connection, settings })
+        }).collect()
     }
 
     async fn activate(
@@ -545,9 +783,11 @@ impl Host {
         let slot = Arc::new(Slot {
             name: saved.name.clone(),
             descriptor,
+            owner: Arc::downgrade(owner),
             state: Mutex::new(State {
                 policy: saved.policy,
                 revision: saved.revision as i64,
+                evidence_epoch: 0,
                 generation: None,
                 accepting: false,
                 identity: None,
@@ -809,6 +1049,8 @@ impl Host {
 
     pub async fn policy(&self, name: &str, policy: AccessPolicy) -> Result<()> {
         let slots = self.slots.lock().await;
+        ensure!(!self.has_stock_settings(name)?,
+            "Use the owner-managed settings for this messaging connection");
         if let Some(managed) = slots.get(name) {
             let mut state = lock(&managed.slot.state);
             state.revision = self.store.set_connection_policy(name, &policy)?;
@@ -886,9 +1128,13 @@ impl Host {
                 });
             }
         }
-        Ok(
-            serde_json::json!({"profile_id":profile,"connections":connections,"input":input,"deliveries":deliveries}),
-        )
+        let verification: BTreeMap<_, _> = lock(&self.factories).iter()
+            .filter_map(|(name, factory)| factory.verification_status().map(|status| (name.clone(), status)))
+            .collect();
+        Ok(serde_json::json!({
+            "profile_id":profile,"connections":connections,"input":input,"deliveries":deliveries,
+            "verification":verification,
+        }))
     }
 
     pub async fn resolve(
@@ -1017,7 +1263,7 @@ impl Host {
     pub fn manual_notification(&self, route: &str, request: &str, text: String) -> Result<String> {
         ensure!(valid_id(route) && valid_id(request), "Invalid messaging destination or request identity");
         let route = self.store.route(route)?.context("Unknown messaging destination")?;
-        ensure!(!route.blocked, "Messaging destination is blocked");
+        ensure!(!route.blocked && !route.is_background(), "Messaging destination is unavailable");
         let producer = store::key("manual", &(&route.id, request))?;
         self.store.notification(&route, &producer, text)
     }
@@ -1033,7 +1279,7 @@ impl Host {
     }
 
     pub(crate) fn authorized_route(&self, id: &str) -> Result<bool> {
-        Ok(self.store.route(id)?.is_some_and(|route| !route.blocked))
+        Ok(self.store.route(id)?.is_some_and(|route| !route.blocked && !route.is_background()))
     }
 
     pub(crate) fn notification_text(
@@ -1185,7 +1431,7 @@ async fn supervise(
                             state.installation = installation;
                             state.generation = Some(ingress.generation.clone());
                             state.accepting = true;
-                            state.health = Health::Ready;
+                            state.health = if adapter.initial_transport_ready() { Health::Ready } else { Health::Connecting };
                             state.gap = gap;
                         }
                         let result =
@@ -1275,10 +1521,13 @@ async fn work_loop(
             _ = scope.slot.changed.notified() => {}
             _ = tick.tick() => {}
         }
+        if lock(&scope.slot.state).health != Health::Ready {
+            continue;
+        }
         let Some(shared) = owner.upgrade() else {
             break Ok(());
         };
-        if let Err(error) = sessions::advance(&shared, scope, stop).await {
+        if let Err(error) = sessions::advance(&shared, scope, adapter.as_ref(), stop).await {
             break if error == GatewayError::StaleConnection {
                 Ok(())
             } else {
@@ -1324,11 +1573,16 @@ async fn deliver(
                     .store
                     .editable_progress(&pending.route, &pending.intent.id))?;
             }
-            let plan = adapter.prepare(&pending.intent).and_then(|mut parts| {
+            let plan = adapter.prepare_with_ingress(&pending.intent, scope).and_then(|mut parts| {
                 let protection = scope.checked(true, |state| {
                     scope.delivery_protection(&state.policy, &pending.intent.room, &pending.intent.id)
                 }).map_err(|_| PreparationFailure::Rejected)?;
                 for part in &mut parts {
+                    if store::Route::is_background_id(&pending.route)
+                        && matches!(part.effect.operation, super::EffectOperation::Provision { .. })
+                    {
+                        return Err(PreparationFailure::Unsupported);
+                    }
                     if let Some(required) = &protection {
                         if part.effect.protection.as_ref().is_some_and(|value| value != required) {
                             return Err(PreparationFailure::Rejected);
@@ -1424,6 +1678,9 @@ fn delivery_authorized(
     state: &State,
     pending: &PendingDelivery,
 ) -> Result<bool, GatewayError> {
+    if state.health != Health::Ready {
+        return Ok(false);
+    }
     let Some(policy) = state.policy.room_policy(&pending.intent.room) else {
         return Ok(false);
     };
@@ -1433,8 +1690,12 @@ fn delivery_authorized(
     if route.blocked || route.connection != scope.connection || route.room != pending.intent.room
         || !db(scope.store.result_released(&scope.connection, &pending.intent.id))?
         || !scope.recheck_quote_delivery(state, &route, &pending.intent.id)?
+        || !scope.thread_provision_allowed(state, &pending.intent, pending.sender.as_ref())?
     {
         return Ok(false);
+    }
+    if route.is_background() {
+        return scope.background_delivery_allowed(state, &route, pending);
     }
     if let Some(sender) = &pending.sender {
         let participant = policy.per_participant.then_some(sender.id.as_str());
@@ -1456,7 +1717,8 @@ fn delivery_authorized(
         };
         return Ok(
             scope.authorize_sender(&state.policy, &pending.intent.room, sender)?
-                && current.id == route.id,
+                && current.id == route.id
+                && scope.thread_reply_allowed(state, &pending.intent, sender)?,
         );
     }
     db(scope.store.allows_notification(&route.id, now(), &scope.transport_scope()?))
@@ -1491,13 +1753,22 @@ fn outbound_policy(
 }
 
 fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]) -> bool {
-    if plan.is_empty() || plan.len() > MAX_PARTS || intent.room.thread.is_some() && !caps.threads {
+    let has_attachment_alternative = plan.iter().any(|part| part.effect.attachment_fallback_for.is_some());
+    let limit = if has_attachment_alternative {
+        super::effects::MAX_ATTACHMENT_PLAN_PARTS
+    } else {
+        MAX_PARTS
+    };
+    if plan.is_empty() || plan.len() > limit || intent.room.thread.is_some() && !caps.threads {
         return false;
     }
     plan.iter().enumerate().all(|(index, part)| {
-        if part.room != intent.room
-            || part.edit_target.is_some()
-                && (index != 0 || !caps.editing || part.edit_target != intent.edit_target)
+        let first_alternative = index == 1
+            && part.effect.attachment_fallback_for == Some(0)
+            && part.edit_target == plan[0].edit_target;
+        let may_edit = caps.editing && (index == 0 || first_alternative)
+            && part.edit_target == intent.edit_target;
+        if part.room != intent.room || part.edit_target.is_some() && !may_edit
         {
             return false;
         }
@@ -1524,6 +1795,6 @@ fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]
     }) && valid_effect_plan(caps, intent, plan)
 }
 
-pub(super) fn now() -> i64 {
+pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

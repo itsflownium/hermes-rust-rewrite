@@ -171,6 +171,8 @@ Archiving or restoring a chat keeps its accepted knowledge available. The privat
 ## Verification
 
 ```sh
+cargo test -p hermes-gateway-core --lib messaging::
+cargo test -p hermes-discord-plugin
 cargo test -p hermes-gateway
 cargo test -p hermes-gateway --test websocket stock_reliquary_enrolls_renames_and_recalls_only_on_request
 cargo test -p hermes-reliquary-plugin --features native

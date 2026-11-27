@@ -21,7 +21,10 @@ pub fn dispatch_role() -> Option<i32> {
     hermes_engine::herdr::dispatch_role()
 }
 
-pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
+pub async fn serve(
+    args: impl IntoIterator<Item = String>,
+    stock_adapters: Vec<crate::messaging::StockAdapter>,
+) -> Result<()> {
     let mut port = 8765;
     let mut host: IpAddr = "127.0.0.1".parse()?;
     let mut root = None;
@@ -86,6 +89,7 @@ pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
         return Ok(());
     }
     let mut config = GatewayConfig::new(&root, Config::from_env());
+    config.stock_adapters = stock_adapters;
     config.bind = (host, port).into();
     let token_path = if ephemeral {
         None

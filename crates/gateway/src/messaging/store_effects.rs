@@ -752,7 +752,7 @@ pub(super) fn claim(
     let row: Option<(u32,u32,String,String)> = tx.query_row(
         "SELECT p.ordinal,p.attempt,p.stage,p.body FROM messaging_parts p
          JOIN messaging_deliveries d ON d.id=p.delivery WHERE d.connection=?1 AND d.id=?2 AND d.stage='planned'
-         AND p.stage NOT IN ('sent','discarded','partial','submitted')
+         AND p.stage NOT IN ('sent','discarded','partial','submitted','skipped')
          AND NOT EXISTS(SELECT 1 FROM messaging_cooldowns c WHERE c.connection=d.connection AND c.until_ms>?3 AND (c.scope='' OR c.scope=d.destination))
          AND NOT EXISTS(SELECT 1 FROM messaging_deliveries earlier WHERE earlier.connection=d.connection AND earlier.destination=d.destination
              AND earlier.id!=d.id AND earlier.stage IN ('pending','planned')
@@ -767,7 +767,9 @@ pub(super) fn claim(
     let Some((ordinal, old_attempt, stage, data)) = row else {
         return Ok(None);
     };
-    if !matches!(stage.as_str(), "pending" | "uncertain") {
+    if !matches!(stage.as_str(), "pending" | "uncertain")
+        || part_retry_at(tx, id, ordinal)?.is_some_and(|until| until > policy.now)
+    {
         return Ok(None);
     }
     let payload = json::<DeliveryPart>(data.clone())?;
@@ -904,14 +906,22 @@ pub(super) fn recheck(
     send: &SendAttempt,
     policy: &OutboundPolicy,
 ) -> Result<bool> {
-    let body: Option<String> = tx.query_row(
-        "SELECT p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id=p.delivery
-         WHERE d.connection=?1 AND p.delivery=?2 AND p.ordinal=?3 AND p.attempt=?4 AND p.generation=?5 AND p.stage='sending'",
-        params![connection,send.delivery_id,send.part,send.attempt,generation], |r| r.get(0),
+    let evidence: Option<(String, bool)> = tx.query_row(
+        "SELECT p.body,a.retransmission FROM messaging_parts p
+         JOIN messaging_deliveries d ON d.id=p.delivery
+         JOIN messaging_effect_attempts a ON a.delivery=p.delivery AND a.ordinal=p.ordinal AND a.attempt=p.attempt
+         WHERE d.connection=?1 AND p.delivery=?2 AND p.ordinal=?3 AND p.attempt=?4
+           AND p.generation=?5 AND a.lease=?5 AND p.stage='sending'",
+        params![connection,send.delivery_id,send.part,send.attempt,generation],
+        |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
-    let Some(body) = body else { return Ok(false) };
+    let Some((body, retransmission)) = evidence else { return Ok(false) };
     let part = json::<DeliveryPart>(body)?;
-    if part != send.payload || send.effect.transport.as_ref() != policy.transport.as_ref() {
+    if part != send.payload || send.reply_anchor != pending.intent.reply_anchor
+        || send.effect.retransmission != retransmission
+        || send.effect.transport.as_ref() != policy.transport.as_ref()
+        || recorded_transport(tx, &send.delivery_id, send.part, send.attempt)?.as_ref() != policy.transport.as_ref()
+    {
         return Ok(false);
     }
     if let Some(guarantee) = &part.effect.replay
@@ -927,10 +937,12 @@ pub(super) fn recheck(
             return Ok(false);
         }
     }
-    Ok(authorize_effect(
-        tx, connection, generation, pending, send.part, &part, policy,
-    )?
-    .is_ok())
+    let Ok(authorized) = authorize_effect(tx, connection, generation, pending, send.part, &part, policy)? else {
+        return Ok(false);
+    };
+    Ok(authorized.dependencies == send.effect.dependencies
+        && authorized.marker == send.effect.marker
+        && retry_recipients(tx, &send.delivery_id, send.part, &part)? == send.effect.recipients)
 }
 
 pub(super) fn release_slot(tx: &Transaction<'_>, id: &str, ordinal: u32) -> Result<()> {
@@ -1041,14 +1053,7 @@ fn recipient_state(
             reason: Some("recipient_outcome_unknown"),
         });
     }
-    let retry_at: Option<i64> = tx
-        .query_row(
-            "SELECT retry_after_ms FROM messaging_effect_parts WHERE delivery=?1 AND ordinal=?2",
-            params![id, ordinal],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
+    let retry_at = part_retry_at(tx, id, ordinal)?;
     if outcomes
         .values()
         .any(|v| matches!(v, RecipientOutcome::NotAccepted))
@@ -1083,6 +1088,31 @@ fn recipient_state(
             reason: Some("recipient_rejected"),
         }
     })
+}
+
+fn part_retry_at(tx: &Connection, delivery: &str, ordinal: u32) -> Result<Option<i64>> {
+    Ok(tx.query_row(
+        "SELECT retry_after_ms FROM messaging_effect_parts WHERE delivery=?1 AND ordinal=?2",
+        params![delivery, ordinal], |row| row.get::<_, Option<i64>>(0),
+    ).optional()?.flatten())
+}
+
+fn defer_part(
+    tx: &Transaction<'_>,
+    delivery: &str,
+    ordinal: u32,
+    now: i64,
+    after: Duration,
+) -> Result<()> {
+    let millis = i64::try_from(after.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(i64::MAX)
+        .max(1);
+    tx.execute(
+        "INSERT INTO messaging_effect_parts (delivery,ordinal,retry_after_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(delivery,ordinal) DO UPDATE SET retry_after_ms=MAX(COALESCE(retry_after_ms,0),excluded.retry_after_ms)",
+        params![delivery, ordinal, now.saturating_add(millis)],
+    )?;
+    Ok(())
 }
 
 pub(super) fn cooldown(
@@ -1465,6 +1495,28 @@ fn record_recipients(
     Ok(classified)
 }
 
+/// An authenticated create can arrive before its REST response. If that
+/// evidence conflicts with a refusal, keep the alternative fenced and let
+/// reconciliation apply the positive evidence to the original attempt.
+fn pending_publication(
+    tx: &Transaction<'_>,
+    connection: &str,
+    destination: &str,
+    delivery: &str,
+    ordinal: u32,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messaging_effect_identifiers k
+         JOIN messaging_effect_observations o ON o.connection=k.connection AND o.destination=k.destination
+          AND o.kind=k.kind AND o.value=k.value
+         WHERE k.connection=?1 AND k.destination=?2 AND k.delivery=?3 AND k.ordinal=?4
+           AND json_extract(o.evidence,'$.recipient') IS NULL
+           AND json_extract(o.evidence,'$.state') IN ('accepted','delivered','read','played')
+           AND (o.kind='provider' OR json_type(o.evidence,'$.receipt')='text'))",
+        params![connection, destination, delivery, ordinal], |row| row.get(0),
+    )?)
+}
+
 pub(super) fn record(
     tx: &Transaction<'_>,
     connection: &str,
@@ -1610,10 +1662,34 @@ pub(super) fn record(
                     }
                 }
             }
-            cooldown(tx, id, scope, after, now)?;
+            if scope == RetryScope::Part {
+                defer_part(tx, id, ordinal, now, after)?;
+            } else {
+                cooldown(tx, id, scope, after, now)?;
+            }
             let mut classified = RecordedEffect::with("pending", Some("rate_limited"));
             classified.release_slot = receipts.is_empty();
             classified
+        }
+        DeliveryResult::AttachmentNotPublished
+            if generation.is_some()
+                && !exact_replay
+                && receipts.is_empty()
+                && matches!(part.effect.operation, EffectOperation::Message | EffectOperation::Publish { .. }) =>
+        {
+            if pending_publication(tx, connection, &dest, id, ordinal)? {
+                RecordedEffect::uncertain()
+            } else {
+                let enabled = tx.execute(
+                    "UPDATE messaging_parts SET stage='pending' WHERE delivery=?1 AND stage='standby'
+                     AND json_extract(body,'$.effect.attachment_fallback_for')=?2",
+                    params![id, ordinal],
+                )? > 0;
+                let stage = if enabled { "skipped" } else { "rejected" };
+                let mut classified = RecordedEffect::with(stage, Some("attachment_not_accepted"));
+                classified.release_slot = true;
+                classified
+            }
         }
         DeliveryResult::EditNotPublished
             if !exact_replay

@@ -45,6 +45,32 @@ async fn ready(home: &Path) -> owner::OwnerConnection {
     }
 }
 #[tokio::test]
+async fn bundled_gateway_registers_discord_for_the_profile_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let _gateway = launch(dir.path());
+    let owner = ready(dir.path()).await;
+    let client = GatewayClient::new(ClientOptions::default());
+    owner.connect(&client).await.unwrap();
+
+    let discovery = client.request("rpc.discover", json!({})).await.unwrap();
+    let methods = discovery["methods"].as_array().unwrap();
+    for method in ["list", "create", "update"] {
+        assert!(methods.contains(&json!(format!("messaging.profile.discord.{method}"))));
+    }
+    let connection = client
+        .request("messaging.profile.discord.create", json!({"name":"discord","settings":{}}))
+        .await
+        .unwrap();
+    assert_eq!(connection["platform"], "discord");
+    assert_eq!(connection["enabled"], false);
+    let listed = client.request("messaging.profile.discord.list", json!({})).await.unwrap();
+    assert_eq!(listed["connections"][0], connection);
+
+    client.close();
+    owner.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn private_catalog_controls_coordinate_viewers_and_preserve_user_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let _gateway = launch(dir.path());

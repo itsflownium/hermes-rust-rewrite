@@ -8,7 +8,7 @@ use super::{
 };
 use anyhow::{Result, ensure};
 use ring::digest::{SHA256, digest};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{
     future::Future,
     io::Write,
@@ -18,12 +18,17 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub(super) const MAX_FILE: usize = 4 * 1024 * 1024;
+pub const MAX_FILE: usize = 4 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ADAPTER_FILE: usize = 100 * 1024 * 1024;
+pub const MAX_ADAPTER_INPUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PROFILE_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_PENDING_GRANTS: i64 = 64;
 const MAX_FETCH_GRANTS_PER_EFFECT: i64 = 32;
 const MAX_READ_LIFETIME: Duration = Duration::from_secs(120);
+pub const MAX_FEEDBACK_TEXT: usize = 256;
+const MAX_FEEDBACK_WAV: usize = 2 * 1024 * 1024;
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_FETCH_LIFETIME: Duration = Duration::from_secs(900);
 const DOWNLOAD_OPERATION: &str = "download_media";
 
@@ -38,6 +43,14 @@ CREATE TABLE IF NOT EXISTS messaging_input_media (
     artifact TEXT NOT NULL, name TEXT NOT NULL,
     PRIMARY KEY(connection,event,sender,room,artifact,name),
     FOREIGN KEY(connection,artifact) REFERENCES messaging_media(connection,id)
+);
+CREATE TABLE IF NOT EXISTS messaging_scoped_input_media (
+    connection TEXT NOT NULL, event TEXT NOT NULL, sender TEXT NOT NULL, room TEXT NOT NULL,
+    artifact TEXT NOT NULL, name TEXT NOT NULL, provider_inline INTEGER NOT NULL,
+    PRIMARY KEY(connection,event,sender,room,artifact,name),
+    FOREIGN KEY(connection,event,sender,room,artifact,name)
+        REFERENCES messaging_input_media(connection,event,sender,room,artifact,name)
+        ON UPDATE CASCADE ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS messaging_spoken_addressing (
     connection TEXT NOT NULL, event TEXT NOT NULL, sender TEXT NOT NULL, room TEXT NOT NULL,
@@ -105,6 +118,16 @@ pub struct MediaRead {
     purpose: MediaPurpose,
     expires_ms: i64,
     protection: Option<String>,
+    max_file: usize,
+    allow_artifact: bool,
+}
+
+/// Called in the gateway's transaction after the audio grant is rechecked.
+pub type AudioSourceRecorder = fn(&rusqlite::Transaction<'_>, &str, &MediaSource) -> anyhow::Result<()>;
+
+pub enum PreparedAudio {
+    Transcript(String),
+    Attachment(AttachmentRef),
 }
 
 /// A profile's speech service. Adapters normalize voice data to 16 kHz mono
@@ -207,6 +230,35 @@ impl Ingress {
         purpose: MediaPurpose,
         lifetime: Duration,
     ) -> Result<MediaRead, GatewayError> {
+        self.authorize_media_with_limit(source, manifest, purpose, lifetime, MAX_FILE, false).await
+    }
+
+    /// Authorize a bounded known-size artifact for a stock adapter.
+    pub async fn authorize_adapter_media(
+        &self,
+        source: MediaSource,
+        manifest: AttachmentManifest,
+        purpose: MediaPurpose,
+        lifetime: Duration,
+        max_file: usize,
+    ) -> Result<MediaRead, GatewayError> {
+        if max_file == 0 || max_file > MAX_ADAPTER_FILE || manifest.size.is_none() {
+            return Err(GatewayError::Invalid);
+        }
+        self.authorize_media_with_limit(
+            source, manifest, purpose, lifetime, max_file, true,
+        ).await
+    }
+
+    async fn authorize_media_with_limit(
+        &self,
+        source: MediaSource,
+        manifest: AttachmentManifest,
+        purpose: MediaPurpose,
+        lifetime: Duration,
+        max_file: usize,
+        allow_artifact: bool,
+    ) -> Result<MediaRead, GatewayError> {
         if !self.capabilities().attachments {
             return Err(GatewayError::Unsupported);
         }
@@ -214,7 +266,7 @@ impl Ingress {
             || !valid_name(&manifest.name)
             || manifest
                 .size
-                .is_some_and(|size| size == 0 || size > MAX_FILE)
+                .is_some_and(|size| size == 0 || size > max_file)
         {
             return Err(GatewayError::Invalid);
         }
@@ -256,6 +308,8 @@ impl Ingress {
                     purpose,
                     expires_ms,
                     protection,
+                    max_file,
+                    allow_artifact,
                 })
             })
         })
@@ -336,7 +390,7 @@ impl Ingress {
         if !status.is_success() {
             return Err(GatewayError::TemporarilyUnavailable);
         }
-        let limit = grant.manifest.size.unwrap_or(MAX_FILE);
+        let limit = grant.manifest.size.unwrap_or(grant.max_file);
         if response.content_length().is_some_and(|n| n > limit as u64) {
             return Err(GatewayError::Invalid);
         }
@@ -352,7 +406,7 @@ impl Ingress {
             }
             bytes.extend_from_slice(&chunk);
         }
-        verify_bytes(&grant.manifest, &bytes)?;
+        verify_bytes(&grant, &bytes)?;
         self.transport_authority(&locator).await?;
         self.finish_attachment(grant, bytes).await
     }
@@ -362,7 +416,8 @@ impl Ingress {
         grant: MediaRead,
         bytes: Vec<u8>,
     ) -> Result<AttachmentRef, GatewayError> {
-        if hermes_engine::Attachment::validate_bytes(&grant.manifest.name, &bytes).is_err() {
+        let preview = hermes_engine::Attachment::validate_bytes(&grant.manifest.name, &bytes).is_ok();
+        if !preview && !grant.allow_artifact {
             return Err(GatewayError::Invalid);
         }
         let scope = self.clone();
@@ -370,21 +425,8 @@ impl Ingress {
             scope.checked(true, |state| {
                 scope.recheck_media(state, &grant)?;
                 db(scope.store.write(|tx| {
-                    let attachment =
-                        put(tx, &scope.connection, grant.manifest.name.clone(), &bytes)?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO messaging_input_media VALUES (?1,?2,?3,?4,?5,?6)",
-                        params![
-                            scope.connection,
-                            grant.source.event_id,
-                            grant.source.sender.id,
-                            serde_json::to_string(&grant.source.room)?,
-                            attachment.id,
-                            attachment.name
-                        ],
-                    )?;
-                    Ok(attachment)
-                }))
+                    put_inbound(tx, &scope.connection, &grant, &bytes, preview)
+                }))?.ok_or(GatewayError::Invalid)
             })
         })
         .await
@@ -476,6 +518,55 @@ impl Ingress {
         Opened: Future<Output = Result<R, GatewayError>>,
     {
         let bytes = self.read_media(grant, open).await?;
+        self.transcribe_bytes(grant, bytes).await
+    }
+
+    /// Decode an authorized platform audio format before invoking profile STT.
+    /// The source manifest is checked against the original bytes.
+    pub async fn prepare_adapter_audio<R, Open, Opened>(
+        &self,
+        grant: MediaRead,
+        record_source: Option<AudioSourceRecorder>,
+        open: Open,
+        decode: fn(&[u8]) -> Result<Vec<u8>, GatewayError>,
+    ) -> Result<PreparedAudio, GatewayError>
+    where
+        R: AsyncRead + Unpin,
+        Open: FnOnce() -> Opened,
+        Opened: Future<Output = Result<R, GatewayError>>,
+    {
+        if grant.purpose != MediaPurpose::VoiceNote || !grant.allow_artifact {
+            return Err(GatewayError::Invalid);
+        }
+        let original = self.read_media(&grant, open).await?;
+        self.checked(true, |state| self.recheck_media(state, &grant))?;
+        let (original, decoded) = blocking(move || {
+            let decoded = decode(&original);
+            Ok((original, decoded))
+        }).await?;
+        let transcript = match decoded {
+            Ok(wav) => self.transcribe_bytes(&grant, wav).await,
+            Err(error) => Err(error),
+        };
+        match transcript {
+            Ok(text) => {
+                if let Some(record_source) = record_source {
+                    self.checked(true, |state| {
+                        self.recheck_media(state, &grant)?;
+                        db(self.store.write(|tx| {
+                            record_source(tx, &self.connection, &grant.source)
+                        }))
+                    })?;
+                }
+                Ok(PreparedAudio::Transcript(text))
+            }
+            Err(GatewayError::Invalid | GatewayError::Unsupported) => self
+                .finish_attachment(grant, original).await.map(PreparedAudio::Attachment),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn transcribe_bytes(&self, grant: &MediaRead, bytes: Vec<u8>) -> Result<String, GatewayError> {
         validate_wav(&bytes, Some(16_000))?;
         let audio = self.store.audio();
         let _guard = tokio::time::timeout(remaining(grant.expires_ms)?, audio.active.lock())
@@ -510,13 +601,13 @@ impl Ingress {
         let bytes = tokio::time::timeout(remaining(grant.expires_ms)?, async {
             let mut reader = open().await?;
             let mut data = Vec::with_capacity(grant.manifest.size.unwrap_or_default());
-            let limit = grant.manifest.size.unwrap_or(MAX_FILE);
+            let limit = grant.manifest.size.unwrap_or(grant.max_file);
             (&mut reader)
                 .take((limit + 1) as u64)
                 .read_to_end(&mut data)
                 .await
                 .map_err(|_| GatewayError::TemporarilyUnavailable)?;
-            verify_bytes(&grant.manifest, &data)?;
+            verify_bytes(grant, &data)?;
             Ok::<_, GatewayError>(data)
         })
         .await
@@ -545,7 +636,7 @@ impl Ingress {
         })
     }
 
-    pub(super) fn spoken_addressed(
+    pub fn spoken_addressed(
         &self,
         state: &State,
         source: &MediaSource,
@@ -568,7 +659,9 @@ impl Ingress {
         if source.room.thread.is_some() && !self.capabilities().threads {
             return Err(GatewayError::Unsupported);
         }
-        if !self.authorize_sender(policy, &source.room, &source.sender)? {
+        if !self.authorize_sender(policy, &source.room, &source.sender)?
+            || !self.thread_source_allowed(state, &source.room, &source.sender, &source.event_id)?
+        {
             return Err(GatewayError::Forbidden);
         }
         if purpose == MediaPurpose::SpokenAddressing {
@@ -612,6 +705,40 @@ impl Ingress {
             })
         })
         .await
+    }
+
+    /// Synthesize a configured live cue for an authorized tool-enabled actor.
+    /// Cues use available local speech capacity and have no artifact or receipt.
+    pub async fn synthesize_voice_feedback(
+        &self,
+        room: &Room,
+        actor: &Sender,
+        phrase: &str,
+    ) -> Result<Vec<u8>, GatewayError> {
+        if phrase.trim().is_empty() || phrase.len() > MAX_FEEDBACK_TEXT {
+            return Err(GatewayError::Invalid);
+        }
+        let check = || self.checked(true, |state| {
+            if state.policy.delivery_policy(room).protection.is_some()
+                || !state.policy.room_policy(room).is_some_and(|room| room.tools)
+                || !self.authorized_identity(&state.policy, room, actor)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            Ok(())
+        });
+        check()?;
+        let audio = self.store.audio();
+        let _permit = audio.active.try_lock().map_err(|_| GatewayError::TemporarilyUnavailable)?;
+        let bytes = tokio::time::timeout(FEEDBACK_TIMEOUT, audio.service.synthesize(&audio.root, phrase))
+            .await.map_err(|_| GatewayError::TemporarilyUnavailable)??;
+        check()?;
+        if bytes.len() > MAX_FEEDBACK_WAV {
+            return Err(GatewayError::Invalid);
+        }
+        validate_wav(&bytes, None)?;
+        Ok(bytes)
     }
 
     /// Render speech from this verified reply's exact committed text. The
@@ -983,6 +1110,16 @@ pub(super) fn put(
     );
     let hash = digest(&SHA256, bytes);
     let id = key("media", &(connection, hash.as_ref()))?;
+    put_blob(tx, connection, id, name, bytes)
+}
+
+fn put_blob(
+    tx: &Transaction<'_>,
+    connection: &str,
+    id: String,
+    name: String,
+    bytes: &[u8],
+) -> Result<AttachmentRef> {
     let cached: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM messaging_media WHERE connection = ?1 AND id = ?2)",
         params![connection, id],
@@ -1006,46 +1143,122 @@ pub(super) fn put(
     Ok(AttachmentRef { id, name })
 }
 
+fn put_inbound(
+    tx: &Transaction<'_>,
+    connection: &str,
+    grant: &MediaRead,
+    bytes: &[u8],
+    preview: bool,
+) -> Result<Option<AttachmentRef>> {
+    let source = &grant.source;
+    let name = &grant.manifest.name;
+    let room = serde_json::to_string(&source.room)?;
+    let kind = if grant.allow_artifact { "scoped-media" } else { "media" };
+    let id = key(kind, &(connection, digest(&SHA256, bytes).as_ref()))?;
+    if grant.allow_artifact {
+        let staged: i64 = tx.query_row(
+            "SELECT coalesce(sum(length(m.bytes)), 0)
+             FROM messaging_input_media i JOIN messaging_media m
+               ON i.connection=m.connection AND i.artifact=m.id
+             WHERE i.connection=?1 AND i.event=?2 AND i.sender=?3 AND i.room=?4
+               AND (i.artifact != ?5 OR i.name != ?6)",
+            params![connection, source.event_id, source.sender.id, room, id, name],
+            |row| row.get(0),
+        )?;
+        if staged + bytes.len() as i64 > MAX_ADAPTER_INPUT_BYTES as i64 {
+            return Ok(None);
+        }
+    }
+    let attachment = put_blob(tx, connection, id, name.clone(), bytes)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO messaging_input_media VALUES (?1,?2,?3,?4,?5,?6)",
+        params![connection, source.event_id, source.sender.id, room, attachment.id, attachment.name],
+    )?;
+    if grant.allow_artifact {
+        tx.execute(
+            "INSERT OR IGNORE INTO messaging_scoped_input_media VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![connection, source.event_id, source.sender.id, room, attachment.id, attachment.name, preview],
+        )?;
+    }
+    Ok(Some(attachment))
+}
+
+const BOUND_INPUT_MEDIA: &str = "
+    FROM messaging_input_media i JOIN messaging_media m
+        ON m.connection=i.connection AND m.id=i.artifact
+    LEFT JOIN messaging_scoped_input_media s
+        ON s.connection=i.connection AND s.event=i.event AND s.sender=i.sender AND s.room=i.room
+        AND s.artifact=i.artifact AND s.name=i.name
+    WHERE i.connection=?1 AND i.event=?2 AND i.sender=?3 AND i.room=?4
+        AND i.artifact=?5 AND i.name=?6";
+
+pub(super) struct InputMedia {
+    pub file: AttachmentRef,
+    pub size: usize,
+    pub preview: bool,
+}
+
 pub(super) fn attachments_authorized(
     tx: &Transaction<'_>,
     connection: &str,
     event: &InboundEvent,
     attachments: &[AttachmentRef],
 ) -> Result<bool> {
-    let room = serde_json::to_string(&event.room)?;
-    let mut query = tx.prepare(
-        "SELECT length(m.bytes) FROM messaging_input_media i JOIN messaging_media m
-            ON m.connection = i.connection AND m.id = i.artifact
-         WHERE i.connection = ?1 AND i.event = ?2 AND i.sender = ?3 AND i.room = ?4
-           AND i.artifact = ?5 AND i.name = ?6",
-    )?;
-    let mut total = 0;
-    for file in attachments {
-        let size: Option<i64> = query
-            .query_row(
-                params![
-                    connection,
-                    event.id,
-                    event.sender.id,
-                    room,
-                    file.id,
-                    file.name
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(size) = size else { return Ok(false) };
-        total += size;
-        if total > MAX_INPUT_BYTES as i64 {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(input_media(tx, connection, event, attachments)?.is_some())
 }
 
-fn verify_bytes(manifest: &AttachmentManifest, data: &[u8]) -> Result<(), GatewayError> {
+pub(super) fn input_media(
+    db: &Connection,
+    connection: &str,
+    event: &InboundEvent,
+    attachments: &[AttachmentRef],
+) -> Result<Option<Vec<InputMedia>>> {
+    let room = serde_json::to_string(&event.room)?;
+    let mut query = db.prepare(&format!("SELECT length(m.bytes),s.provider_inline {BOUND_INPUT_MEDIA}"))?;
+    let mut total = 0;
+    let mut preview_bytes = 0;
+    let mut extended = true;
+    let mut refs = Vec::with_capacity(attachments.len());
+    for file in attachments {
+        let Some((size, inline)) = query.query_row(
+            params![connection, event.id, event.sender.id, room, file.id, file.name],
+            |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Option<bool>>(1)?)),
+        ).optional()? else { return Ok(None) };
+        let size = usize::try_from(size)?;
+        total += size;
+        extended &= inline.is_some();
+        let preview = inline.unwrap_or(true) && preview_bytes + size <= MAX_INPUT_BYTES;
+        if preview {
+            preview_bytes += size;
+        }
+        refs.push(InputMedia { file: file.clone(), size, preview });
+    }
+    let limit = if extended { MAX_ADAPTER_INPUT_BYTES } else { MAX_INPUT_BYTES };
+    Ok((total <= limit).then_some(refs))
+}
+
+pub fn read_input_artifact(
+    db: &Connection,
+    connection: &str,
+    event: &InboundEvent,
+    file: &AttachmentRef,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let room = serde_json::to_string(&event.room)?;
+    let position = i64::try_from(offset.checked_add(1).ok_or_else(|| anyhow::anyhow!("Invalid attachment offset"))?)?;
+    let limit = i64::try_from(limit)?;
+    db.query_row(
+        &format!("SELECT substr(m.bytes,?7,?8) {BOUND_INPUT_MEDIA} AND s.artifact IS NOT NULL"),
+        params![connection,event.id,event.sender.id,room,file.id,file.name,position,limit],
+        |row| row.get(0),
+    ).optional().map_err(Into::into)
+}
+
+fn verify_bytes(grant: &MediaRead, data: &[u8]) -> Result<(), GatewayError> {
+    let manifest = &grant.manifest;
     if data.is_empty()
-        || data.len() > MAX_FILE
+        || data.len() > grant.max_file
         || manifest.size.is_some_and(|n| n != data.len())
         || manifest
             .sha256
@@ -1065,7 +1278,7 @@ fn valid_source(source: &MediaSource) -> bool {
         && source.sender.roles.iter().all(|id| valid_id(id))
 }
 
-pub(super) fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     valid_id(name) && name != "." && name != ".." && !name.contains(['/', '\\', ':'])
 }
 

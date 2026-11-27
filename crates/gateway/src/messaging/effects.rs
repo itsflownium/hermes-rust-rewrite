@@ -3,6 +3,9 @@ use super::{AttachmentRef, Room};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 
+// Leave room for the complete 256 KiB reply and repeated code fences.
+pub const MAX_ATTACHMENT_PLAN_PARTS: usize = 160;
+
 /// Additional operations an adapter explicitly supports.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EffectCapabilities {
@@ -35,6 +38,9 @@ pub struct Effect {
     pub replay: Option<ReplayGuarantee>,
     /// Permit a quiet send in the same room after proof that an edit did not occur.
     pub publish_after_definite_edit_refusal: bool,
+    /// An ordered text alternative released only if this earlier part's attachment
+    /// was definitively refused before the message was published.
+    pub attachment_fallback_for: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -66,6 +72,8 @@ pub enum EffectOperation {
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionResource {
     Thread,
+    /// Create a thread from the exact previously published starter message.
+    ThreadFromMessage { starter: u32 },
     Topic,
 }
 
@@ -274,6 +282,9 @@ impl EffectOperation {
     pub(super) fn dependencies(&self) -> Vec<EffectDependency> {
         let dependency = |part, kind| EffectDependency { part, kind };
         match self {
+            Self::Provision { resource: ProvisionResource::ThreadFromMessage { starter } } => {
+                vec![dependency(*starter, ReceiptKind::Message)]
+            }
             Self::Upload {
                 step: UploadStep::Chunk { begin, .. },
                 ..
@@ -583,6 +594,7 @@ pub(super) fn valid_effect_plan(
                 .and_then(|p| p.effect.operation.receipt_kind())
                 != Some(dependency.kind)
         }) || !valid_operation(caps, intent, part, previous)
+            || !valid_attachment_fallback(caps, part, previous)
         {
             return false;
         }
@@ -599,6 +611,54 @@ pub(super) fn valid_effect_plan(
                     }
             )
         })
+}
+
+fn valid_attachment_fallback(
+    caps: Capabilities,
+    part: &DeliveryPart,
+    previous: &[DeliveryPart],
+) -> bool {
+    let effect = &part.effect;
+    let Some(source) = effect.attachment_fallback_for else {
+        return true;
+    };
+    let Some(primary) = previous.get(source as usize) else {
+        return false;
+    };
+    let first = previous.len() - 1 == source as usize;
+    let original = &primary.effect;
+    caps.attachments
+        && matches!(&primary.body, DeliveryBody::Reply(_))
+        && matches!(&part.body, DeliveryBody::Reply(message)
+            if !message.text.trim().is_empty() && message.attachments.is_empty())
+        && primary.room == part.room
+        && original.attachment_fallback_for.is_none()
+        && matches!(
+            &original.operation,
+            EffectOperation::Message | EffectOperation::Publish { .. }
+        )
+        && original.operation == effect.operation
+        && effect
+            .operation
+            .dependencies()
+            .iter()
+            .all(|dependency| dependency.kind == ReceiptKind::Destination)
+        && original.visibility == EffectVisibility::default()
+        && effect.visibility == original.visibility
+        && effect.protection == original.protection
+        && effect.transport == original.transport
+        && effect.consent_required == original.consent_required
+        && effect.reply_grant == original.reply_grant
+        && effect.correlation_scope == original.correlation_scope
+        && original.recipients.is_empty()
+        && effect.recipients.is_empty()
+        && !original.write_only
+        && !effect.write_only
+        && (part.edit_target.is_none() || first && part.edit_target == primary.edit_target)
+        && (first
+            || previous
+                .last()
+                .is_some_and(|part| part.effect.attachment_fallback_for == Some(source)))
 }
 
 fn valid_operation(

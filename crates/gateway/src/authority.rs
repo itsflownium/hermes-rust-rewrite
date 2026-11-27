@@ -19,6 +19,8 @@ pub(super) struct ChannelExecution {
     #[serde(skip)]
     pub policy: hermes_engine::ChannelTurnPolicy,
     #[serde(skip)]
+    pub first_tool_feedback: Option<messaging::FirstToolFeedback>,
+    #[serde(skip)]
     pub approval_context: Option<messaging::ToolApprovalContext>,
 }
 

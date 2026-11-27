@@ -70,17 +70,7 @@ async fn audio_gateway(
     config: AdapterConfig,
     speech: Arc<SpeechFixture>,
 ) -> RunningGateway {
-    let mut profile = GatewayConfig::new(
-        root,
-        Config {
-            base_url: model.url.clone(),
-            model: "fixture".into(),
-            api_key: String::new(),
-        },
-    );
-    profile.adapters.push(config);
-    profile.messaging_audio = Some(speech);
-    Gateway::start(profile).await.unwrap()
+    model.gateway_with_audio(root, vec![config], Some(speech)).await
 }
 
 fn add_attachment(input: &mut InboundEvent, attachment: AttachmentRef) {

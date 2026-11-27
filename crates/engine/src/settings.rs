@@ -230,7 +230,7 @@ impl ProfileSettings {
         match name {
             "get_current_time"=>self.clock_tools,
             "terminal"|"process_manage"=>self.terminal_tools,
-            "list_directory"|"read_file"|"write_file"|"search_files"=>self.file_tools,
+            "list_directory"|"read_file"|"write_file"|"search_files"|crate::channel_attachments::TOOL=>self.file_tools,
             "skills_list"|"skill_view"=>self.skill_tools,
             "memory"|"memory_query"|"refine_query"|"traverse_graph"|"archive_search"|"archive_read"|"echo_read"=>self.memory_tool,
             "delegate_task"=>true,

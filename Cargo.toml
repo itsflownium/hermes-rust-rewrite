@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engine", "crates/desktop", "crates/library", "crates/gateway", "crates/telegram", "crates/python-host", "crates/plugins/reliquary"]
+members = ["crates/engine", "crates/desktop", "crates/library", "crates/gateway", "crates/gateway/core", "crates/plugins/discord", "crates/telegram", "crates/python-host", "crates/plugins/reliquary"]
 default-members = ["crates/desktop"]
 exclude = ["vendor"]
 resolver = "2"
@@ -29,3 +29,8 @@ reliquary-project-environment = { path = "vendor/reliquary-project-environment" 
 [patch.crates-io]
 # GTK3 requires glib 0.18. This copy carries the upstream VariantStrIter fix.
 glib = { git = "https://github.com/Lokee86/hermes-rust-rewrite.git", rev = "036f8720136dac1200992639b648b968623e6583" }
+# Discord voice dependency backports. See vendor/DISCORD-VOICE-PATCHES.md.
+davey = { path = "vendor/davey" }
+openmls_basic_credential = { path = "vendor/openmls-basic-credential" }
+openmls_rust_crypto = { path = "vendor/openmls-rust-crypto" }
+songbird = { path = "vendor/songbird" }

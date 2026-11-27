@@ -12,6 +12,7 @@ use std::{io::Read, path::Path, sync::Arc};
 pub(super) async fn advance(
     owner: &Arc<Shared>,
     scope: &Ingress,
+    adapter: &dyn Adapter,
     stop: &CancellationToken,
 ) -> Result<(), GatewayError> {
     db(scope.store.expire_preparations(&scope.connection, chrono::Utc::now().timestamp_millis()))?;
@@ -21,8 +22,8 @@ pub(super) async fn advance(
         }
         match &input.event.body {
             InboundBody::Control(control) => apply_control(owner, scope, &input, control).await?,
-            InboundBody::Command(Command::UseSkill { .. })
-            | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, input).await?,
+            InboundBody::Command(Command::UseSkill { .. } | Command::Background { .. })
+            | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, adapter, input).await?,
             InboundBody::Command(command) => apply_command(owner, scope, &input, command).await?,
         }
     }
@@ -48,7 +49,11 @@ async fn session_for(
             let owner = owner.clone();
             let key = creation_key.clone();
             let route_id = route.id.clone();
-            let title = format!("{} conversation", scope.platform());
+            let title = if route.is_background() {
+                format!("{} background job", scope.platform())
+            } else {
+                format!("{} conversation", scope.platform())
+            };
             let created = tokio::task::spawn_blocking(move || {
                 let mut collision = false;
                 let result = owner
@@ -135,15 +140,18 @@ fn authorized(
     Ok(scope
         .route_event(&state.policy, &work.event)?
         .is_ok_and(|route| route.id == work.route.id)
+        && scope.thread_source_allowed(state, &work.event.room, &work.event.sender, &work.event.id)?
         && scope.recheck_quote(state, &work.event, &work.route)?)
 }
 
 async fn advance_message(
     owner: &Arc<Shared>,
     scope: &Ingress,
+    adapter: &dyn Adapter,
     work: PendingInput,
 ) -> Result<(), GatewayError> {
     let wake = matches!(work.event.body, InboundBody::Wake);
+    let background = work.route.is_background();
     let unadmitted = matches!(work.stage.as_str(), "pending" | "admitting");
     let allowed = scope.checked(true, |state| authorized(scope, state, &work))?;
     let quote_revoked = !allowed
@@ -191,7 +199,7 @@ async fn advance_message(
                     })?;
                     &synthetic_message
                 }
-                InboundBody::Command(Command::UseSkill { input, .. }) => {
+                InboundBody::Command(Command::UseSkill { input, .. } | Command::Background { text: input }) => {
                     synthetic_message = Message::text(input);
                     &synthetic_message
                 }
@@ -201,7 +209,7 @@ async fn advance_message(
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
-                capture(scope, &session.dir, &message.attachments)
+                capture(scope, &session.dir, &work.event, &message.attachments)
                     .map(Some)
                     .map_err(|_| GatewayError::Invalid)
             }) {
@@ -217,9 +225,13 @@ async fn advance_message(
                 }
                 Err(error) => return Err(error),
             };
-            let result = owner
-                .submit_channel(session, message.text.clone(), attachments, native_id)
-                .await;
+            let (attachments, opaque) = attachments;
+            let text = if opaque && message.text.trim().is_empty() && attachments.is_empty() {
+                "A file was attached.".to_owned()
+            } else {
+                message.text.clone()
+            };
+            let result = owner.submit_channel(session, text, attachments, native_id).await;
             if let Err(error) = result {
                 return match error.data["reason"].as_str() {
                     Some("admission_conflict") => {
@@ -270,11 +282,15 @@ async fn advance_message(
     }
     match receipt["status"].as_str() {
         Some("queued") if allowed => {
+            let feedback = (!background && !wake)
+                .then(|| adapter.first_tool_feedback(scope.clone(), &work.event))
+                .flatten();
             let claim = scope.checked(true, |state| {
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
-                let quote = scope.quote_context_source(state, &work.event, &work.route)?;
+                let context = scope.prepared_context_source(state, &work.event, &work.route)?;
+                let attachments = attachment_context(scope, &work)?;
                 let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
                 let resource = super::profile::resource_event_id(&work.event.id);
@@ -284,7 +300,17 @@ async fn advance_message(
                     policy.prompt = None;
                     policy.skills = None;
                 }
-                let model = policy.model.or(db(scope.store.route_model(&work.route.id))?);
+                let model_route = if background {
+                    let participant = state.policy.room_policy(&work.event.room)
+                        .filter(|room| room.per_participant)
+                        .map(|_| work.event.sender.id.as_str());
+                    db(Route::new(&scope.connection, work.event.room.clone(), participant))?.id
+                } else {
+                    work.route.id.clone()
+                };
+                let model = policy.model.or(db(scope.store.route_model(
+                    &model_route, &scope.model_provider_scope()?,
+                ))?);
                 let selected_skill = match &work.event.body {
                     InboundBody::Command(Command::UseSkill { skill, .. }) => Some(skill.clone()),
                     _ => None,
@@ -299,9 +325,10 @@ async fn advance_message(
                     &native_id,
                     ChannelExecution {
                         tools,
-                        interactive: individual && scope.capabilities().interactive_prompts,
+                        interactive: individual && !background && scope.capabilities().interactive_prompts,
                         model,
-                        approval_context: (individual && !wake && tools).then(|| super::ToolApprovalContext {
+                        first_tool_feedback: if tools { feedback } else { None },
+                        approval_context: (individual && !background && !wake && tools).then(|| super::ToolApprovalContext {
                             ingress: scope.clone(),
                             route: work.route.id.clone(),
                             room: work.event.room.clone(),
@@ -313,7 +340,8 @@ async fn advance_message(
                             approval_mode,
                             skills: policy.skills,
                             selected_skill,
-                            quote,
+                            context,
+                            attachments,
                         },
                     },
                 ))
@@ -322,7 +350,7 @@ async fn advance_message(
                 owner.spawn_worker(session, claim).await;
             }
         }
-        Some("started") if allowed => {
+        Some("started") if allowed && !background => {
             scope.checked(true, |state| {
                 if !authorized(scope, state, &work)? {
                     return Ok(());
@@ -480,6 +508,9 @@ async fn apply_command(
     work: &PendingInput,
     command: &Command,
 ) -> Result<(), GatewayError> {
+    if command.uses_profile_model() {
+        return commands::apply_profile_model(owner, scope, work, command).await;
+    }
     let session = if matches!(command, Command::Queue) {
         session_for(owner, scope, &work.route, false).await?
     } else { None };
@@ -491,6 +522,7 @@ async fn apply_command(
             _ => true,
         },
         scope.authorize_operator(&state.policy, &work.event.room, &work.event.sender)?,
+        state.policy.spoken_reply_default(&work.event.room),
     ))
 }
 
@@ -642,14 +674,79 @@ fn finish_control(scope: &Ingress, work: &PendingInput, result: &str) -> Result<
 fn capture(
     scope: &Ingress,
     session: &Path,
+    event: &InboundEvent,
     refs: &[AttachmentRef],
-) -> anyhow::Result<Vec<Attachment>> {
-    refs.iter()
-        .map(|reference| {
-            let bytes = scope.store.attachment(&scope.connection, reference)?;
-            Attachment::capture_bytes(session, reference.name.clone(), &bytes)
-        })
-        .collect()
+) -> anyhow::Result<(Vec<Attachment>, bool)> {
+    let media = scope.store.read(|db| super::media::input_media(db, &scope.connection, event, refs))?
+        .ok_or_else(|| anyhow::anyhow!("Attachment source is not available"))?;
+    let mut files = Vec::new();
+    let mut opaque = false;
+    for entry in media {
+        if entry.preview {
+            let bytes = scope.store.attachment(&scope.connection, &entry.file)?;
+            files.push(Attachment::capture_bytes(session, entry.file.name, &bytes)?);
+        } else {
+            opaque = true;
+        }
+    }
+    Ok((files, opaque))
+}
+
+fn attachment_context(
+    scope: &Ingress,
+    work: &PendingInput,
+) -> Result<Option<hermes_engine::ChannelAttachments>, GatewayError> {
+    let InboundBody::Message(message) = &work.event.body else { return Ok(None) };
+    if message.attachments.is_empty() {
+        return Ok(None);
+    }
+    let media = db(scope.store.read(|tx| {
+        super::media::input_media(tx, &scope.connection, &work.event, &message.attachments)
+    }))?.ok_or(GatewayError::Forbidden)?;
+    let mut files = Vec::new();
+    let mut refs = std::collections::BTreeMap::new();
+    for (index, entry) in media.into_iter().enumerate() {
+        if !entry.preview {
+            let id = db(store::key("input-attachment", &(&scope.connection, &work.event.id, index)))?;
+            files.push(hermes_engine::ChannelAttachment {
+                id: id.clone(),
+                filename: entry.file.name.clone(),
+                bytes: entry.size,
+            });
+            refs.insert(id, entry.file);
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let work = Arc::new(work.clone());
+    let (check_scope, check_work) = (scope.clone(), work.clone());
+    let recheck = Arc::new(move || check_scope.checked(true, |state| {
+        if !authorized(&check_scope, state, &check_work)? {
+            return Err(GatewayError::Forbidden);
+        }
+        Ok(())
+    }).map_err(Into::into));
+    let reader = scope.clone();
+    let read = Arc::new(move |id: &str, offset, limit| -> anyhow::Result<Vec<u8>> {
+        let reference = refs.get(id).ok_or(GatewayError::Forbidden)?;
+        anyhow::ensure!(limit > 0 && limit <= hermes_engine::MAX_CHANNEL_ATTACHMENT_READ,
+            "Invalid attachment range");
+        Ok(reader.checked(true, |state| {
+            if !authorized(&reader, state, &work)?
+                || !state.policy.room_policy(&work.event.room).is_some_and(|room| room.tools)
+                || !reader.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            db(reader.store.read(|tx| {
+                super::media::read_input_artifact(tx, &reader.connection, &work.event, reference, offset, limit)
+            }))?.ok_or(GatewayError::Forbidden)
+        })?)
+    });
+    Ok(Some(hermes_engine::ChannelAttachments { files, recheck, read }))
 }
 
 fn outbound_message(scope: &Ingress, session: &Path, text: &str, tools: bool) -> Message {

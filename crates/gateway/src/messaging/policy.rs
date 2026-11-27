@@ -1,4 +1,4 @@
-use super::types::{AccessPolicy, Room, RoomKind, RoomPolicy, Sender};
+use super::{SpokenReplyMode, types::{AccessPolicy, Room, RoomKind, RoomPolicy, Sender}};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,10 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ScopePolicy {
     pub denied_users: BTreeSet<String>,
     pub denied_roles: BTreeSet<String>,
+    pub denied_destinations: BTreeSet<String>,
     pub direct: RoomRules,
     pub rooms: BTreeMap<String, RoomRules>,
     pub threads: BTreeMap<String, BTreeMap<String, RoomRules>>,
     pub require_actor_evidence: bool,
+    #[serde(alias = "background_commands_disabled")]
+    pub scoped_commands_disabled: bool,
+    pub spoken_reply_default: Option<SpokenReplyMode>,
     pub pair_direct: bool,
     pub events: BTreeMap<String, ResourcePolicy>,
 }
@@ -25,10 +29,33 @@ pub struct RoomRules {
     pub roles: Option<BTreeSet<String>>,
     pub denied_users: BTreeSet<String>,
     pub denied_roles: BTreeSet<String>,
+    /// The nearest explicit grant replaces broader allow choices. Denials and
+    /// inherited restrictions still apply.
+    pub grant: Option<RoomGrant>,
+    pub requester_commands: Option<RequesterCommandGrant>,
     pub mention_required: Option<bool>,
     pub per_participant: Option<bool>,
     pub turn: TurnPolicy,
     pub delivery: Option<DeliveryPolicy>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoomGrant {
+    pub open: bool,
+    pub paired: bool,
+    pub users: BTreeSet<String>,
+    pub roles: BTreeSet<String>,
+}
+
+/// An explicit command grant for an authenticated requester. It has no
+/// authority over conversation turns, deliveries or interactive prompts.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequesterCommandGrant {
+    pub users: BTreeSet<String>,
+    pub roles: BTreeSet<String>,
+    pub operator_roles: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,6 +67,23 @@ pub struct TurnPolicy {
     pub tools: Option<bool>,
     pub approval: Option<ApprovalPolicy>,
     pub approval_reuse: Option<ApprovalReuse>,
+}
+
+impl TurnPolicy {
+    pub fn overlay(&mut self, next: &Self) {
+        if next.model.is_some() {
+            self.model.clone_from(&next.model);
+        }
+        if next.prompt.is_some() {
+            self.prompt.clone_from(&next.prompt);
+        }
+        if next.skills.is_some() {
+            self.skills.clone_from(&next.skills);
+        }
+        self.tools = next.tools.or(self.tools);
+        self.approval = next.approval.or(self.approval);
+        self.approval_reuse = next.approval_reuse.or(self.approval_reuse);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +121,11 @@ pub struct ResourcePolicy {
 }
 
 impl AccessPolicy {
+    pub(super) fn spoken_reply_default(&self, room: &Room) -> Option<SpokenReplyMode> {
+        self.room_policy(room).filter(|policy| policy.spoken_replies)?;
+        self.scope.spoken_reply_default
+    }
+
     fn rules(&self, room: &Room) -> impl Iterator<Item = &RoomRules> {
         (room.kind == RoomKind::Direct)
             .then_some(&self.scope.direct)
@@ -90,6 +139,11 @@ impl AccessPolicy {
     }
 
     pub(super) fn room_policy(&self, room: &Room) -> Option<RoomPolicy> {
+        if self.scope.denied_destinations.contains(&room.chat)
+            || room.thread.as_ref().is_some_and(|thread| self.scope.denied_destinations.contains(thread))
+        {
+            return None;
+        }
         let mut current = match room.kind {
             RoomKind::Direct => RoomPolicy {
                 tools: self.direct_tools,
@@ -121,11 +175,17 @@ impl AccessPolicy {
         Some(current)
     }
 
-    pub(super) fn grants_sender(&self, room: &Room, sender: &Sender, paired: bool) -> bool {
+    pub fn grants_sender(&self, room: &Room, sender: &Sender, paired: bool) -> bool {
+        let grant = self.rules(room).filter_map(|rule| rule.grant.as_ref()).last();
+        let allowed = grant.map_or_else(
+            || paired || self.allows(sender),
+            |grant| grant.open || (grant.paired && paired) || grant.users.contains(&sender.id)
+                || !grant.roles.is_disjoint(&sender.roles),
+        );
         self.room_policy(room).is_some()
             && (!self.scope.denied_users.contains(&sender.id)
                 && self.scope.denied_roles.is_disjoint(&sender.roles))
-            && (paired || self.allows(sender))
+            && allowed
             && self.rules(room).all(|rules| {
                 !rules.denied_users.contains(&sender.id)
                     && rules.denied_roles.is_disjoint(&sender.roles)
@@ -141,22 +201,40 @@ impl AccessPolicy {
             })
     }
 
+    pub(super) fn permits_membership_lookup(&self, room: &Room, actor: &str) -> bool {
+        self.room_policy(room).is_some()
+            && !self.scope.denied_users.contains(actor)
+            && self.rules(room).all(|rule| !rule.denied_users.contains(actor))
+    }
+
+    pub fn allows_scoped_command(&self, room: &Room, actor: &Sender) -> bool {
+        !self.scope.scoped_commands_disabled
+            && self.requester_commands_for(room).is_none_or(|grant| {
+                grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)
+            })
+    }
+
+    fn requester_commands_for(&self, room: &Room) -> Option<&RequesterCommandGrant> {
+        self.rules(room).filter_map(|rule| rule.requester_commands.as_ref()).last()
+    }
+
+    pub fn requester_command_grant(
+        &self, room: &Room, actor: &Sender,
+    ) -> Option<&RequesterCommandGrant> {
+        let grant = self.requester_commands_for(room)?;
+        (self.room_policy(room).is_some()
+            && !self.scope.denied_users.contains(&actor.id)
+            && self.scope.denied_roles.is_disjoint(&actor.roles)
+            && self.rules(room).all(|rule| !rule.denied_users.contains(&actor.id)
+                && rule.denied_roles.is_disjoint(&actor.roles))
+            && (grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)))
+            .then_some(grant)
+    }
+
     pub fn turn_policy(&self, room: &Room) -> TurnPolicy {
         let mut result = TurnPolicy::default();
         for rules in self.rules(room) {
-            let next = &rules.turn;
-            if next.model.is_some() {
-                result.model.clone_from(&next.model);
-            }
-            if next.prompt.is_some() {
-                result.prompt.clone_from(&next.prompt);
-            }
-            if next.skills.is_some() {
-                result.skills.clone_from(&next.skills);
-            }
-            result.tools = next.tools.or(result.tools);
-            result.approval = next.approval.or(result.approval);
-            result.approval_reuse = next.approval_reuse.or(result.approval_reuse);
+            result.overlay(&rules.turn);
         }
         result
     }

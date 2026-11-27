@@ -157,6 +157,7 @@ pub struct GatewayConfig {
     pub token: String,
     pub provider: Config,
     pub adapters: Vec<messaging::AdapterConfig>,
+    pub stock_adapters: Vec<messaging::StockAdapter>,
     pub messaging_audio: Option<Arc<dyn messaging::AudioService>>,
     #[cfg(test)]
     telegram_transport: Option<Arc<dyn hermes_telegram::Transport>>,
@@ -170,6 +171,7 @@ impl GatewayConfig {
             token: String::new(),
             provider,
             adapters: Vec::new(),
+            stock_adapters: Vec::new(),
             messaging_audio: None,
             #[cfg(test)]
             telegram_transport: None,
@@ -306,7 +308,7 @@ impl Gateway {
             ensure!(names.insert(adapter.name.clone()), "Duplicate messaging connection name");
         }
         let library = Library::open(&config.library_root)?;
-        let messaging = messaging::Host::open(library.root(), config.messaging_audio)?;
+        let messaging = messaging::Host::open(library.root(), config.messaging_audio, config.stock_adapters)?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -365,6 +367,7 @@ impl Gateway {
         for config in config.adapters {
             shared.messaging.restore(&shared, config).await?;
         }
+        shared.messaging.restore_stock(&shared).await?;
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
         if stock_plugins::has_memory_plugin() {
             let owner = shared.clone();
@@ -946,7 +949,7 @@ impl Shared {
                 json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","event replay is bounded to the current process"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).map(|method| (*method).to_owned()).chain(self.messaging.stock_methods()).collect::<Vec<_>>(),"limitations":["one running turn per session","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
@@ -1245,7 +1248,32 @@ impl Shared {
                 }
                 Ok(json!({"closed":true}))
             }
-            _ => self.profile_method(method, params, peer).await,
+            _ => {
+                let Some((adapter, operation)) = self.messaging.stock_method(method) else {
+                    return self.profile_method(method, params, peer).await;
+                };
+                if operation == "list" {
+                    let connections = self.messaging.stock_connections(adapter).await.map_err(RpcError::internal)?;
+                    return Ok(json!({"connections":connections}));
+                }
+                let name = required_string(params, "name")?;
+                let configuration = (adapter.configure)(self.library.root(), params["settings"].clone())
+                    .map_err(|_| RpcError::invalid("Invalid messaging adapter settings"))?;
+                let (revision, enabled) = if operation == "create" {
+                    let enabled = match params.get("enabled") {
+                        Some(value) => value.as_bool().ok_or_else(|| RpcError::invalid("Invalid enabled state"))?,
+                        None => false,
+                    };
+                    (None, enabled)
+                } else {
+                    let revision = params["revision"].as_u64().ok_or_else(|| RpcError::invalid("revision is required"))?;
+                    (Some(revision), false)
+                };
+                let connection = self.messaging
+                    .save_stock(self, adapter, name, revision, enabled, configuration)
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!(connection))
+            }
         }
     }
 
@@ -1887,7 +1915,12 @@ impl Shared {
             channel_tools: admission.channel.as_ref().is_some_and(|policy| policy.tools),
             channel_policy: admission.channel.as_ref().map(|channel| channel.policy.clone()).unwrap_or_default(),
         };
+        let feedback_stop = cancel.child_token();
+        let _feedback_lifetime = feedback_stop.clone().drop_guard();
         let mut stream = TurnStream {
+            first_tool_feedback: admission.channel.as_mut()
+                .and_then(|channel| channel.first_tool_feedback.take())
+                .map(|feedback| (feedback, feedback_stop.clone())),
             approval_context: admission.channel.as_ref().and_then(|channel| channel.approval_context.clone()),
             unattended: admission.unattended || admission.channel.as_ref().is_some_and(|policy| !policy.interactive),
             id: admission.id.clone(),
@@ -1964,6 +1997,7 @@ impl Shared {
             }
             (result, target.history().clone(), target.take_reasoning_summaries())
         };
+        feedback_stop.cancel();
         while let Ok(event) = rx.try_recv() {
             self.handle_event(&session, event, &mut stream, &cancel);
         }
@@ -2018,6 +2052,9 @@ impl Shared {
                 .iter_mut()
                 .find(|r| Some(&r.id) == current.as_ref())
             {
+                if let Some(channel) = &mut receipt.channel {
+                    channel.first_tool_feedback = None;
+                }
                 receipt.status = "terminal".into();
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
@@ -2078,6 +2115,9 @@ impl Shared {
             Event::Subagent(progress) => self.emit(session, "subagent.progress", serde_json::to_value(&progress).unwrap_or_default()),
             Event::MemoryRecall(status) => self.emit(session, "memory.recall", serde_json::to_value(status).unwrap_or_default()),
             Event::Clarification { question, choices, answer } => {
+                if stream.unattended {
+                    return;
+                }
                 let request = new_id();
                 let mut view = lock(&session.view);
                 let payload = json!({"kind":"clarification","request_id":request,"execution_generation":view.generation,
@@ -2113,6 +2153,11 @@ impl Shared {
                                 }
                                 for call in calls {
                                     if stream.tools.insert(call.id.clone()) {
+                                        if let Some((feedback, stop)) = stream.first_tool_feedback.take()
+                                            && !stop.is_cancelled()
+                                        {
+                                            feedback(stop);
+                                        }
                                         self.emit(session,"tool.start",json!({"tool_id":call.id,"name":call.name,"args":serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null),"args_text":call.arguments}));
                                     }
                                 }
@@ -2186,6 +2231,7 @@ impl Shared {
 }
 
 struct TurnStream {
+    first_tool_feedback: Option<(messaging::FirstToolFeedback, CancellationToken)>,
     unattended: bool,
     approval_context: Option<messaging::ToolApprovalContext>,
     id: String,

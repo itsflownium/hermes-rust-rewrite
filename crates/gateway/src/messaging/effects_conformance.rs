@@ -1321,7 +1321,7 @@ async fn revoked_actor_can_only_leave_a_scoped_marker_retirement() {
         .set_adapter_policy("fixture", AccessPolicy::default())
         .await
         .unwrap();
-    model.state.steer_release.add_permits(1);
+    model.release_waiting_turn();
     assert!(ingress.retire_marker(marker.clone()).await.unwrap());
     let cleanup = driver.sent().await;
     assert!(matches!(

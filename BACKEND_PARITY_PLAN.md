@@ -2,7 +2,7 @@
 
 Mercury is a native Rust implementation of the workflows Hermes is moving toward. The immediate goal is a gateway and agent runtime that can sustain interactive work, messaging, and unattended jobs across client disconnects and gateway restarts. Keeping that behavior in the backend lets contributors make progress before the next Hermes Desktop UI ships.
 
-Mercury already has durable turns and approvals, local terminals, routines, native storage, an embedded plugin host, and native Telegram polling and sending. The core gateway adapter contract and its conformance tests establish the foundation. Spec each stock messaging plugin individually, then implement and verify the shared requirements before starting plugin work. Each completes transport and live acceptance before the next implementation starts. [Gateway adapter contract](crates/gateway/ADAPTER_CONTRACT.md) · [Messaging implementation order](#messaging-implementation-order)
+Mercury already has durable turns and approvals, local terminals, routines, native storage, an embedded plugin host, and native Telegram polling and sending. The core gateway adapter contract and its conformance tests establish the foundation. Spec each stock messaging plugin individually, then implement and verify the shared requirements before starting plugin work. Build each stock plugin in its own workspace crate and bundle it through the gateway's adapter registry. Each completes transport and live acceptance before the next implementation starts. [Gateway adapter contract](crates/gateway/ADAPTER_CONTRACT.md) · [Messaging implementation order](#messaging-implementation-order)
 
 ## Scope
 
